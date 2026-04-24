@@ -134,6 +134,7 @@ fn component_availability_is_complete_when_ja4t_ja4_and_protocol_are_present() {
         cipher_suites: Some(vec![0x1301, 0x1302]),
         extensions: Some(vec![0x0000, 0x0010, 0x000d]),
         alpn: Some(vec!["h2".to_string()]),
+        alpn_raw: None,
         signature_algorithms: Some(vec![0x0403]),
     };
 

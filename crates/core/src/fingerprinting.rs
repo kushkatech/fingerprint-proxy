@@ -80,6 +80,7 @@ pub struct Ja4Input {
     pub cipher_suites: Option<Vec<u16>>,
     pub extensions: Option<Vec<u16>>,
     pub alpn: Option<Vec<String>>,
+    pub alpn_raw: Option<Vec<Vec<u8>>>,
     pub signature_algorithms: Option<Vec<u16>>,
 }
 

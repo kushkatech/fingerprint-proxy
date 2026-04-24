@@ -11,17 +11,19 @@ forwarding.
 Runtime target:
 
 - Linux only
-- Linux kernel `4.3+` for full inline `JA4T` support via `TCP_SAVE_SYN` /
-  `TCP_SAVED_SYN`
+- Linux kernel `4.3+` for full inline `JA4T` support when ordered TCP option
+  data is available through `TCP_SAVE_SYN` / `TCP_SAVED_SYN`
 
 It is built for deployments where backend services need high-quality client
 metadata without owning TLS termination, fingerprint computation, or
 edge-specific routing logic themselves. The proxy terminates TLS, derives
 fingerprints such as JA4, JA4T, and JA4One as the current built-in set, with
 additional fingerprint types planned and intended to be added as implementation
-work on the project continues. It applies deterministic request processing
-modules and forwards traffic using the same negotiated HTTP protocol version
-instead of translating between protocols.
+work on the project continues. Full JA4T completeness depends on ordered TCP
+option data; fallback paths that lack option ordering are reported as partial or
+unavailable rather than complete. The proxy applies deterministic request
+processing modules and forwards traffic using the same negotiated HTTP protocol
+version instead of translating between protocols.
 
 The current implementation focuses on the TCP/TLS path first, but the project
 is intentionally not limited to that path. HTTP/3 over QUIC is part of the
@@ -42,14 +44,16 @@ network classification, and consistent request enrichment across many services.
 
 - terminate client TLS once at the proxy boundary;
 - compute client fingerprints before request processing;
-- attach fingerprint and classification metadata to upstream requests;
+- attach complete fingerprint values and classification metadata to upstream
+  requests;
 - preserve the negotiated application protocol;
 - keep upstream services simple.
 
 Typical use cases:
 
-- pass JA4, JA4T, JA4One, and future fingerprint types to backend services
-  through headers;
+- pass complete JA4, JA4T, JA4One, and future fingerprint values to backend
+  services through headers while tracking partial or unavailable fingerprints
+  internally;
 - prepare for QUIC/HTTP3 traffic where transport-specific fingerprint handling
   differs from the TCP-oriented JA4T model;
 - classify traffic into internal, local, trusted, datacenter, crawler, or any
@@ -73,9 +77,10 @@ Today, the project already provides a substantial end-to-end runtime surface:
 - transparent WebSocket forwarding over HTTP/1.1;
 - transparent gRPC forwarding over HTTP/2;
 - JA4, JA4T, and JA4One fingerprint computation;
-- inline Linux saved-SYN capture for complete JA4T runtime inputs without
-  passive packet sniffing;
-- fingerprint availability tracking and propagation to upstream headers;
+- inline Linux saved-SYN capture for ordered TCP option data needed by complete
+  JA4T runtime inputs, without passive packet sniffing;
+- fingerprint availability tracking with complete-only upstream header
+  propagation;
 - ordered first-match client network classification;
 - dynamic domain configuration via validated immutable snapshots;
 - health endpoints, runtime statistics, and a protected stats API;
@@ -93,6 +98,12 @@ over QUIC remains a required target for the project, and the repository already
 contains QUIC packet, frame, runtime-boundary, and fingerprinting foundation
 work that is intended to be carried through to full end-to-end support.
 
+Connection pooling is active for scoped HTTP/1.1 and HTTP/2 runtime forwarding.
+The runtime uses the upstream pool helpers for HTTP/1.1 reusable keep-alive
+connections and sequential HTTP/2 upstream connection reuse for subsequent
+forwarded streams. It does not claim concurrent HTTP/2 multiplex sharing.
+Pooling counters are recorded from forwarded traffic.
+
 ## Design Principles
 
 - No HTTP protocol downgrade, upgrade, or translation.
@@ -109,8 +120,9 @@ The project is most useful as an edge enrichment layer rather than as a generic
 reverse proxy. In practice, that means it already gives you:
 
 - multi-domain TLS termination with deterministic certificate selection;
-- fingerprint propagation for JA4, JA4T, JA4One, and future fingerprint
-  types;
+- complete-only fingerprint propagation for JA4, JA4T, JA4One, and future
+  fingerprint types, with runtime availability tracking so partial JA4T is not
+  presented as complete;
 - a path toward QUIC-aware fingerprinting for HTTP/3 traffic instead of forcing
   TCP-specific fingerprints onto QUIC connections;
 - request enrichment that can be turned into backend-visible policy inputs;
@@ -136,7 +148,7 @@ At a high level, request handling follows this flow:
 Current built-in request-stage modules include:
 
 - `fingerprint_header`: injects configured fingerprint headers into upstream
-  requests;
+  requests only when the corresponding fingerprint is complete;
 - `network_classification`: applies ordered first-match CIDR classification;
 - `forward`: continues the request toward the configured upstream target.
 
@@ -185,7 +197,8 @@ Currently implemented:
 - HTTP/2 upstream forwarding;
 - WebSocket over HTTP/1.1;
 - gRPC over HTTP/2;
-- JA4 / JA4T / JA4One fingerprint propagation;
+- JA4 / JA4T / JA4One fingerprint propagation with runtime availability
+  tracking;
 - health endpoints and stats API;
 - dynamic domain configuration snapshots;
 - IPv4 / IPv6 / dual-stack deployments;
@@ -225,11 +238,11 @@ request-processing behavior, more classification logic, more enrichment rules,
 and additional fingerprint-related handling without rewriting the whole runtime.
 
 That includes room for more transport-aware fingerprint work over time. Today
-the project ships JA4, JA4T, and JA4One for the active TCP/TLS path. For the
-QUIC path, the repository already contains groundwork for QUIC-specific
-fingerprint outputs, including transport-distinct JA4One handling and a stable
-QUIC metadata signature surface, while end-to-end HTTP/3 runtime support is
-being completed.
+the project ships JA4, JA4T, and JA4One for the active TCP/TLS path, with JA4T
+complete only when ordered TCP option data is available. For the QUIC path, the
+repository already contains groundwork for QUIC-specific fingerprint outputs,
+including transport-distinct JA4One handling and a stable QUIC metadata
+signature surface, while end-to-end HTTP/3 runtime support is being completed.
 
 ## Configuration Model
 
@@ -279,7 +292,8 @@ self-signed certificate warning.
 What you will see:
 
 - the demo page shows the forwarded `JA4T`, `JA4`, and `JA4One` headers
-  rendered by the backend behind the proxy;
+  rendered by the backend behind the proxy; do not treat the presence of `JA4T`
+  alone as a guarantee of universal JA4T completeness;
 - `https://localhost:8443/json` returns the same result as raw JSON so you can
   inspect the forwarded headers directly from the CLI.
 

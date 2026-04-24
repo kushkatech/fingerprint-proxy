@@ -8,9 +8,10 @@ This quickstart uses direct-bind mode and file-backed configuration.
 - Linux only
 - Linux kernel `4.3+` for `TCP_SAVE_SYN` / `TCP_SAVED_SYN`
 
-`JA4T` runtime capture depends on Linux saved-SYN support. On kernels older
-than `4.3`, the proxy will not start its TCP listeners with full `JA4T`
-runtime support.
+`JA4T` runtime completeness depends on ordered TCP option data from Linux
+saved-SYN support. On kernels older than `4.3`, the proxy will not start its
+TCP listeners with full `JA4T` runtime support. If a path lacks ordered TCP
+option data, JA4T is treated as partial or unavailable rather than complete.
 
 
 ## Local Docker Demo
@@ -41,7 +42,10 @@ The local Docker setup starts:
 - an auto-generated self-signed certificate for `localhost`
 
 That makes it easy to inspect the enrichment result directly in a browser,
-including headers such as `X-JA4T`, `X-JA4`, and `X-JA4One`.
+including complete-only headers such as `X-JA4T`, `X-JA4`, and `X-JA4One`.
+In Docker or other local environments, if required JA4T data is missing, the
+proxy keeps that availability state in internal diagnostics instead of sending a
+partial TCP fingerprint as a production upstream header.
 
 Useful demo URLs:
 

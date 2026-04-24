@@ -25,6 +25,21 @@ fn complete_example_matches_expected_format() {
 }
 
 #[test]
+fn partial_when_tcp_option_order_missing() {
+    let input = Ja4TInput {
+        window_size: Some(29200),
+        option_kinds_in_order: vec![],
+        mss: Some(1424),
+        window_scale: Some(7),
+    };
+
+    let fp = compute_ja4t_fingerprint(Some(&input), SystemTime::UNIX_EPOCH);
+    assert_eq!(fp.availability, FingerprintAvailability::Partial);
+    assert_eq!(fp.value.as_deref(), Some("29200__1424_7"));
+    assert_eq!(fp.failure_reason, None);
+}
+
+#[test]
 fn partial_when_mss_missing() {
     let input = Ja4TInput {
         window_size: Some(29200),
@@ -106,7 +121,7 @@ fn deterministic_for_identical_inputs() {
 fn compute_only_populates_ja4t_and_leaves_others_unavailable() {
     let input = Ja4TInput {
         window_size: Some(1),
-        option_kinds_in_order: vec![],
+        option_kinds_in_order: vec![2],
         mss: Some(1460),
         window_scale: Some(0),
     };

@@ -1,3 +1,6 @@
+use fingerprint_proxy_bootstrap_config::dynamic::upstream_check::{
+    TcpConnectUpstreamChecker, UpstreamConnectivityChecker, UpstreamValidationTarget,
+};
 use fingerprint_proxy_core::connection::{ConnectionContext, TransportProtocol};
 use fingerprint_proxy_core::enrichment::{
     ClientNetworkCidr, ClientNetworkClassificationRule, ProcessingStage,
@@ -50,7 +53,7 @@ use fingerprint_proxy_quic::{
     parse_packet_header as parse_quic_packet_header, QuicEstablishment, QuicEstablishmentError,
     QuicPacketError,
 };
-use fingerprint_proxy_stats::RuntimeStatsRegistry;
+use fingerprint_proxy_stats::{PoolingEvent, RuntimeStatsRegistry};
 use fingerprint_proxy_tls_entry::{
     DispatcherDeps, DispatcherInput, DispatcherOutput, NegotiatedAlpn, TlsEntryDispatcher,
 };
@@ -64,6 +67,11 @@ use fingerprint_proxy_upstream::http2::{
     BoxedUpstreamIo as UpstreamIo, UpstreamTransport as UpstreamTransportMode,
 };
 use fingerprint_proxy_upstream::manager::UpstreamConnectionManager;
+use fingerprint_proxy_upstream::pool::http1::Http1ReleaseOutcome;
+use fingerprint_proxy_upstream::{
+    UPSTREAM_CONNECT_FAILED_MESSAGE, UPSTREAM_TLS_H2_ALPN_MISMATCH_MESSAGE,
+    UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE,
+};
 use fingerprint_proxy_websocket::{
     proxy_websocket_bidirectionally, validate_websocket_handshake_response,
 };
@@ -75,10 +83,10 @@ use rustls::ServerConfig;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::SystemTime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -93,8 +101,10 @@ const DEFAULT_UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::
 const DEFAULT_UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const DEFAULT_UPSTREAM_MAX_HEADER_BYTES: usize = 8 * 1024;
 const DEFAULT_UPSTREAM_MAX_BODY_BYTES: usize = 64 * 1024;
-const TLS_CLIENT_HELLO_PEEK_BYTES: usize = 16 * 1024;
-const TLS_CLIENT_HELLO_PEEK_ATTEMPTS: usize = 3;
+const DEFAULT_RUNTIME_READINESS_UPSTREAM_CHECK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const DEFAULT_RUNTIME_READINESS_UPSTREAM_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_millis(250);
 const QUIC_UDP_RECV_BUFFER_BYTES: usize = 2048;
 const QUIC_SHORT_HEADER_DESTINATION_CONNECTION_ID_LEN: usize = 0;
 const QUIC_UDP_RUNTIME_STUB_MESSAGE: &str = "STUB[T291]: QUIC UDP runtime boundary reached; HTTP/3 end-to-end forwarding remains unimplemented (no HTTP/2 or HTTP/1.x fallback)";
@@ -476,7 +486,6 @@ async fn handle_connection_with_read_buf_size(
     let _connection_guard = deps.http1.connection_stats.open_connection(unix_now());
     let peer_addr = tcp.peer_addr().ok();
     let local_addr = tcp.local_addr().ok();
-    let runtime_tls_data = capture_runtime_tls_client_hello_data(&tcp).await;
     deps.http1.ensure_domain_config_loaded()?;
     deps.http2.ensure_domain_config_loaded()?;
     let domain = deps
@@ -487,10 +496,15 @@ async fn handle_connection_with_read_buf_size(
         .ok_or_else(|| FpError::internal("domain config is missing before TLS handshake"))?;
 
     let runtime_tcp_metadata = capture_runtime_tcp_metadata(&tcp);
+    let recording_tcp = RecordingTcpStream::new(tcp);
+    let captured_tls_handshake = recording_tcp.captured_bytes();
+    let recording_enabled = recording_tcp.recording_enabled();
 
-    let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp)
+    let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), recording_tcp)
         .await
         .map_err(|e| FpError::invalid_protocol_data(format!("TLS handshake failed: {e}")))?;
+    let runtime_tls_data = capture_runtime_tls_client_hello_data(&captured_tls_handshake);
+    recording_enabled.store(false, Ordering::Relaxed);
     let sni = start
         .client_hello()
         .server_name()
@@ -631,6 +645,7 @@ struct Http1Deps {
     bound_domain_snapshot: std::sync::OnceLock<
         Arc<fingerprint_proxy_bootstrap_config::dynamic::atomic_update::DynamicConfigSnapshot>,
     >,
+    readiness_upstream_cache: Arc<RuntimeReadinessUpstreamCache>,
     upstream_connection_manager: UpstreamConnectionManager,
     tls_sni: Option<String>,
     peer_addr: Option<SocketAddr>,
@@ -656,6 +671,7 @@ impl Http1Deps {
             connection_stats: connection_stats_integration(runtime_stats),
             dynamic_config_state,
             bound_domain_snapshot: std::sync::OnceLock::new(),
+            readiness_upstream_cache: Arc::new(RuntimeReadinessUpstreamCache::default()),
             upstream_connection_manager: UpstreamConnectionManager::new(upstream_tls_client_config),
             tls_sni: None,
             peer_addr: None,
@@ -674,6 +690,7 @@ impl Http1Deps {
             connection_stats: self.connection_stats.clone(),
             dynamic_config_state: self.dynamic_config_state.clone(),
             bound_domain_snapshot: std::sync::OnceLock::new(),
+            readiness_upstream_cache: Arc::clone(&self.readiness_upstream_cache),
             upstream_connection_manager: self.upstream_connection_manager.clone(),
             tls_sni: None,
             peer_addr: None,
@@ -729,12 +746,29 @@ impl Http1Deps {
             .bound_domain_snapshot
             .get()
             .map(|snapshot| snapshot.config());
+        let upstreams_reachable =
+            snapshot.is_some_and(|domain| self.runtime_upstreams_reachable_for_readiness(domain));
         crate::health::RuntimeHealthState {
             runtime_started: true,
             accept_loop_responsive: true,
             config_loaded: snapshot.is_some(),
-            upstreams_reachable: snapshot.is_some_and(|cfg| !cfg.virtual_hosts.is_empty()),
+            upstreams_reachable,
         }
+    }
+
+    fn runtime_upstreams_reachable_for_readiness(
+        &self,
+        domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
+    ) -> bool {
+        let checker =
+            TcpConnectUpstreamChecker::new(DEFAULT_RUNTIME_READINESS_UPSTREAM_CHECK_TIMEOUT)
+                .expect("runtime readiness upstream check timeout is non-zero");
+        self.readiness_upstream_cache.upstreams_reachable(
+            domain,
+            &checker,
+            Instant::now(),
+            DEFAULT_RUNTIME_READINESS_UPSTREAM_CACHE_TTL,
+        )
     }
 
     fn new_request_id(&self) -> RequestId {
@@ -764,6 +798,33 @@ impl Http1Deps {
     ) -> Option<&fingerprint_proxy_bootstrap_config::config::VirtualHostConfig> {
         let domain = self.bound_domain_snapshot.get()?.config();
         select_virtual_host(domain, self.tls_sni.as_deref(), self.local_addr)
+    }
+
+    fn finalize_http1_response(
+        &self,
+        ctx: &mut RequestContext,
+        response: HttpResponse,
+    ) -> FpResult<HttpResponse> {
+        ctx.response = response;
+        self.pipeline
+            .execute(ctx, ProcessingStage::Response)
+            .map_err(|e| e.error)?;
+        Ok(ctx.response.clone())
+    }
+
+    fn record_pooling_event(&self, event: PoolingEvent) {
+        self.runtime_stats.record_pooling_event(unix_now(), event);
+    }
+
+    fn record_http1_release_outcome(&self, outcome: Http1ReleaseOutcome) {
+        let event = match outcome {
+            Http1ReleaseOutcome::Pooled => PoolingEvent::Http1ReleasePooled,
+            Http1ReleaseOutcome::DiscardedNotReusable => {
+                PoolingEvent::Http1ReleaseDiscardedNotReusable
+            }
+            Http1ReleaseOutcome::DiscardedPoolFull => PoolingEvent::Http1ReleaseDiscardedPoolFull,
+        };
+        self.record_pooling_event(event);
     }
 
     async fn forward_http1_continued(&self, mut ctx: RequestContext) -> FpResult<HttpResponse> {
@@ -817,11 +878,6 @@ impl Http1Deps {
         };
 
         let mut upstream_req = ctx.request.clone();
-
-        upstream_req
-            .headers
-            .insert("Connection".to_string(), "close".to_string());
-
         let bytes = serialize_http1_request_with_body_and_trailers(&mut upstream_req)?;
         let transport = match vhost.upstream.protocol {
             fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Http => {
@@ -834,22 +890,114 @@ impl Http1Deps {
         let upstream_resp: FpResult<HttpResponse> = match vhost.upstream.protocol {
             fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Http
             | fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Https => {
-                let mut upstream = self
-                    .upstream_connection_manager
-                    .connect_http1(&vhost.upstream.host, vhost.upstream.port, transport)
-                    .await?;
-                write_http1_request_async(&mut upstream, &bytes).await?;
-                Ok(read_http1_response_async(
-                    &mut upstream,
-                    Http1UpstreamLimits::default(),
-                    DEFAULT_UPSTREAM_READ_TIMEOUT,
-                )
-                .await?)
+                let mut allow_retry_after_stale_pool = true;
+                loop {
+                    let acquired = match self
+                        .upstream_connection_manager
+                        .connect_http1_pooled(
+                            &vhost.upstream.host,
+                            vhost.upstream.port,
+                            transport,
+                            unix_now(),
+                        )
+                        .await
+                    {
+                        Ok(acquired) => acquired,
+                        Err(e) => {
+                            self.record_pooling_event(PoolingEvent::Http1AcquireMiss);
+                            self.connection_stats.record_upstream_error(unix_now());
+                            if let Some(response) = upstream_failure_response_for_http1(
+                                UpstreamFailureStage::Connect,
+                                &e,
+                            ) {
+                                return self.finalize_http1_response(&mut ctx, response);
+                            }
+                            return Err(e);
+                        }
+                    };
+                    let (mut upstream, reused) = acquired.into_parts();
+                    self.record_pooling_event(if reused {
+                        PoolingEvent::Http1AcquireHit
+                    } else {
+                        PoolingEvent::Http1AcquireMiss
+                    });
+
+                    if let Err(e) = write_http1_request_async(&mut upstream, &bytes).await {
+                        let outcome = self.upstream_connection_manager.release_http1_pooled(
+                            &vhost.upstream.host,
+                            vhost.upstream.port,
+                            transport,
+                            upstream,
+                            false,
+                            unix_now(),
+                        );
+                        self.record_http1_release_outcome(outcome);
+                        if reused && allow_retry_after_stale_pool {
+                            allow_retry_after_stale_pool = false;
+                            continue;
+                        }
+                        self.connection_stats.record_upstream_error(unix_now());
+                        if let Some(response) =
+                            upstream_failure_response_for_http1(UpstreamFailureStage::Write, &e)
+                        {
+                            return self.finalize_http1_response(&mut ctx, response);
+                        }
+                        return Err(e);
+                    }
+
+                    let response_result = read_http1_response_async(
+                        &mut upstream,
+                        Http1UpstreamLimits::default(),
+                        DEFAULT_UPSTREAM_READ_TIMEOUT,
+                    )
+                    .await;
+                    match response_result {
+                        Ok(response) => {
+                            let reusable =
+                                http1_upstream_connection_reusable(&upstream_req, &response);
+                            let outcome = self.upstream_connection_manager.release_http1_pooled(
+                                &vhost.upstream.host,
+                                vhost.upstream.port,
+                                transport,
+                                upstream,
+                                reusable,
+                                unix_now(),
+                            );
+                            self.record_http1_release_outcome(outcome);
+                            break Ok(response);
+                        }
+                        Err(e) => {
+                            let outcome = self.upstream_connection_manager.release_http1_pooled(
+                                &vhost.upstream.host,
+                                vhost.upstream.port,
+                                transport,
+                                upstream,
+                                false,
+                                unix_now(),
+                            );
+                            self.record_http1_release_outcome(outcome);
+                            if reused && allow_retry_after_stale_pool {
+                                allow_retry_after_stale_pool = false;
+                                continue;
+                            }
+                            break Err(e);
+                        }
+                    }
+                }
             }
         };
-        let upstream_resp = upstream_resp.inspect_err(|_e| {
-            self.connection_stats.record_upstream_error(unix_now());
-        })?;
+        let upstream_resp = match upstream_resp {
+            Ok(response) => response,
+            Err(e) => {
+                self.connection_stats.record_upstream_error(unix_now());
+                if let Some(response) =
+                    upstream_failure_response_for_http1(UpstreamFailureStage::ResponseRead, &e)
+                {
+                    return self.finalize_http1_response(&mut ctx, response);
+                }
+                return Err(e);
+            }
+        };
 
         ctx.response = upstream_resp;
         self.pipeline
@@ -895,18 +1043,85 @@ impl Http1Deps {
             }
         };
 
-        let mut upstream = self
+        let mut upstream = match self
             .upstream_connection_manager
             .connect_http1(&vhost.upstream.host, vhost.upstream.port, transport)
-            .await?;
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(e) => {
+                self.connection_stats.record_upstream_error(unix_now());
+                if let Some(response) =
+                    upstream_failure_response_for_http1(UpstreamFailureStage::Connect, &e)
+                {
+                    let response = self.finalize_http1_response(&mut ctx, response)?;
+                    let response_bytes = serialize_http1_response(&response).map_err(|e| {
+                        FpError::invalid_protocol_data(format!("HTTP/1 serialize error: {e:?}"))
+                    })?;
+                    tls.write_all(&response_bytes)
+                        .await
+                        .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
 
         let mut upstream_req = ctx.request.clone();
         let request_bytes = serialize_http1_request_with_body_and_trailers(&mut upstream_req)?;
-        write_http1_request_async(&mut upstream, &request_bytes).await?;
+        if let Err(e) = write_http1_request_async(&mut upstream, &request_bytes).await {
+            self.connection_stats.record_upstream_error(unix_now());
+            if let Some(response) =
+                upstream_failure_response_for_http1(UpstreamFailureStage::Write, &e)
+            {
+                let response = self.finalize_http1_response(&mut ctx, response)?;
+                let response_bytes = serialize_http1_response(&response).map_err(|e| {
+                    FpError::invalid_protocol_data(format!("HTTP/1 serialize error: {e:?}"))
+                })?;
+                tls.write_all(&response_bytes)
+                    .await
+                    .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
+                return Ok(());
+            }
+            return Err(e);
+        }
 
         let (mut upstream_response, initial_upstream_bytes) =
-            read_websocket_upgrade_response_async(&mut upstream).await?;
-        validate_websocket_handshake_response(&ctx.request, &upstream_response)?;
+            match read_websocket_upgrade_response_async(&mut upstream).await {
+                Ok(response) => response,
+                Err(e) => {
+                    self.connection_stats.record_upstream_error(unix_now());
+                    if let Some(response) =
+                        upstream_failure_response_for_http1(UpstreamFailureStage::ResponseRead, &e)
+                    {
+                        let response = self.finalize_http1_response(&mut ctx, response)?;
+                        let response_bytes = serialize_http1_response(&response).map_err(|e| {
+                            FpError::invalid_protocol_data(format!("HTTP/1 serialize error: {e:?}"))
+                        })?;
+                        tls.write_all(&response_bytes)
+                            .await
+                            .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
+            };
+        if let Err(e) = validate_websocket_handshake_response(&ctx.request, &upstream_response) {
+            self.connection_stats.record_upstream_error(unix_now());
+            if let Some(response) =
+                upstream_failure_response_for_http1(UpstreamFailureStage::ResponseRead, &e)
+            {
+                let response = self.finalize_http1_response(&mut ctx, response)?;
+                let response_bytes = serialize_http1_response(&response).map_err(|e| {
+                    FpError::invalid_protocol_data(format!("HTTP/1 serialize error: {e:?}"))
+                })?;
+                tls.write_all(&response_bytes)
+                    .await
+                    .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
+                return Ok(());
+            }
+            return Err(e);
+        }
 
         ctx.response = upstream_response.clone();
         self.pipeline
@@ -929,6 +1144,73 @@ impl Http1Deps {
         )
         .await
     }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeReadinessUpstreamCache {
+    entry: Mutex<Option<RuntimeReadinessUpstreamCacheEntry>>,
+}
+
+#[derive(Debug)]
+struct RuntimeReadinessUpstreamCacheEntry {
+    revision_id: String,
+    checked_at: Instant,
+    upstreams_reachable: bool,
+}
+
+impl RuntimeReadinessUpstreamCache {
+    fn upstreams_reachable(
+        &self,
+        domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
+        checker: &dyn UpstreamConnectivityChecker,
+        now: Instant,
+        ttl: std::time::Duration,
+    ) -> bool {
+        let revision_id = domain.revision_id().as_str().to_string();
+
+        match self.entry.lock() {
+            Ok(guard) => {
+                if let Some(entry) = guard.as_ref() {
+                    if entry.revision_id == revision_id
+                        && now.duration_since(entry.checked_at) < ttl
+                    {
+                        return entry.upstreams_reachable;
+                    }
+                }
+            }
+            Err(_) => return false,
+        }
+
+        let upstreams_reachable = runtime_upstreams_reachable_for_readiness_with(domain, checker);
+        if let Ok(mut guard) = self.entry.lock() {
+            *guard = Some(RuntimeReadinessUpstreamCacheEntry {
+                revision_id,
+                checked_at: now,
+                upstreams_reachable,
+            });
+        }
+        upstreams_reachable
+    }
+}
+
+fn runtime_upstreams_reachable_for_readiness_with(
+    domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
+    checker: &dyn UpstreamConnectivityChecker,
+) -> bool {
+    if domain.virtual_hosts.is_empty() {
+        return false;
+    }
+
+    domain.virtual_hosts.iter().all(|vhost| {
+        checker
+            .check(&UpstreamValidationTarget {
+                virtual_host_id: vhost.id,
+                protocol: vhost.upstream.protocol,
+                host: vhost.upstream.host.clone(),
+                port: vhost.upstream.port,
+            })
+            .is_ok()
+    })
 }
 
 struct RuntimeDeps {
@@ -995,21 +1277,81 @@ fn connection_stats_integration(
     )
 }
 
-async fn capture_runtime_tls_client_hello_data(tcp: &TcpStream) -> Option<TlsClientHelloData> {
-    let mut peek_buf = vec![0u8; TLS_CLIENT_HELLO_PEEK_BYTES];
-    for attempt in 0..TLS_CLIENT_HELLO_PEEK_ATTEMPTS {
-        let n = tcp.peek(&mut peek_buf).await.ok()?;
-        if n == 0 {
-            return None;
-        }
-        if let Some(data) = extract_client_hello_data_from_tls_records(&peek_buf[..n]) {
-            return Some(data);
-        }
-        if attempt + 1 < TLS_CLIENT_HELLO_PEEK_ATTEMPTS {
-            tokio::task::yield_now().await;
+struct RecordingTcpStream {
+    inner: TcpStream,
+    captured: Arc<Mutex<Vec<u8>>>,
+    recording_enabled: Arc<AtomicBool>,
+}
+
+impl RecordingTcpStream {
+    fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            captured: Arc::new(Mutex::new(Vec::new())),
+            recording_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
-    None
+
+    fn captured_bytes(&self) -> Arc<Mutex<Vec<u8>>> {
+        Arc::clone(&self.captured)
+    }
+
+    fn recording_enabled(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.recording_enabled)
+    }
+}
+
+impl AsyncRead for RecordingTcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            let filled = buf.filled();
+            if filled.len() > before && self.recording_enabled.load(Ordering::Relaxed) {
+                let mut captured = self
+                    .captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                captured.extend_from_slice(&filled[before..]);
+            }
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for RecordingTcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn capture_runtime_tls_client_hello_data(
+    captured_tls_handshake: &Arc<Mutex<Vec<u8>>>,
+) -> Option<TlsClientHelloData> {
+    let captured = captured_tls_handshake.lock().ok()?;
+    extract_client_hello_data_from_tls_records(&captured)
 }
 
 fn compute_runtime_fingerprinting_result_for_connection(
@@ -1783,6 +2125,8 @@ where
     Ok(())
 }
 
+const UPSTREAM_READ_TIMED_OUT_MESSAGE: &str = "upstream read timed out";
+
 async fn read_upstream_chunk<S>(
     stream: &mut S,
     buf: &mut [u8],
@@ -1794,7 +2138,9 @@ where
     match tokio::time::timeout(timeout, stream.read(buf)).await {
         Ok(Ok(n)) => Ok(n),
         Ok(Err(_)) => Err(FpError::invalid_protocol_data("upstream read failed")),
-        Err(_) => Err(FpError::invalid_protocol_data("upstream read timed out")),
+        Err(_) => Err(FpError::invalid_protocol_data(
+            UPSTREAM_READ_TIMED_OUT_MESSAGE,
+        )),
     }
 }
 
@@ -1808,38 +2154,139 @@ where
         .map_err(|_| FpError::invalid_protocol_data("upstream write failed"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamErrorResponseClass {
+    ServiceUnavailable,
+    GatewayTimeout,
+    BadGateway,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamFailureStage {
+    Connect,
+    Write,
+    ResponseRead,
+}
+
+fn classify_upstream_failure(
+    stage: UpstreamFailureStage,
+    error: &FpError,
+) -> Option<UpstreamErrorResponseClass> {
+    if error.kind != fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData {
+        return None;
+    }
+
+    match stage {
+        UpstreamFailureStage::Connect if error.message == UPSTREAM_CONNECT_FAILED_MESSAGE => {
+            Some(UpstreamErrorResponseClass::ServiceUnavailable)
+        }
+        UpstreamFailureStage::Connect
+            if error.message == UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE
+                || error.message == UPSTREAM_TLS_H2_ALPN_MISMATCH_MESSAGE =>
+        {
+            Some(UpstreamErrorResponseClass::BadGateway)
+        }
+        UpstreamFailureStage::Connect => None,
+        UpstreamFailureStage::Write => Some(UpstreamErrorResponseClass::BadGateway),
+        UpstreamFailureStage::ResponseRead if error.message == UPSTREAM_READ_TIMED_OUT_MESSAGE => {
+            Some(UpstreamErrorResponseClass::GatewayTimeout)
+        }
+        UpstreamFailureStage::ResponseRead => Some(UpstreamErrorResponseClass::BadGateway),
+    }
+}
+
+fn upstream_failure_response_for_http1(
+    stage: UpstreamFailureStage,
+    error: &FpError,
+) -> Option<HttpResponse> {
+    let class = classify_upstream_failure(stage, error)?;
+    Some(upstream_error_response(
+        "HTTP/1.1",
+        class,
+        HeaderCase::Http1,
+    ))
+}
+
+fn upstream_failure_response_for_http2(
+    stage: UpstreamFailureStage,
+    error: &FpError,
+) -> Option<HttpResponse> {
+    let class = classify_upstream_failure(stage, error)?;
+    Some(upstream_error_response("HTTP/2", class, HeaderCase::Http2))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HeaderCase {
+    Http1,
+    Http2,
+}
+
+fn upstream_error_response(
+    version: &str,
+    class: UpstreamErrorResponseClass,
+    header_case: HeaderCase,
+) -> HttpResponse {
+    let status = match class {
+        UpstreamErrorResponseClass::ServiceUnavailable => 503,
+        UpstreamErrorResponseClass::GatewayTimeout => 504,
+        UpstreamErrorResponseClass::BadGateway => 502,
+    };
+    let mut response = HttpResponse {
+        version: version.to_string(),
+        status: Some(status),
+        ..HttpResponse::default()
+    };
+    let content_length = match header_case {
+        HeaderCase::Http1 => "Content-Length",
+        HeaderCase::Http2 => "content-length",
+    };
+    response
+        .headers
+        .insert(content_length.to_string(), "0".to_string());
+    if matches!(header_case, HeaderCase::Http1) {
+        response
+            .headers
+            .insert("Connection".to_string(), "close".to_string());
+    }
+    response
+}
+
 async fn forward_http2_request(
     upstream: &mut UpstreamIo,
     request: &HttpRequest,
     authority: &str,
     scheme: &str,
     timeout: std::time::Duration,
-) -> FpResult<HttpResponse> {
-    upstream
-        .write_all(Http2ConnectionPreface::CLIENT_BYTES.as_slice())
-        .await
-        .map_err(|_| FpError::invalid_protocol_data("upstream write failed"))?;
+    stream_id: u32,
+    write_connection_preface: bool,
+) -> FpResult<(HttpResponse, u32)> {
+    if write_connection_preface {
+        upstream
+            .write_all(Http2ConnectionPreface::CLIENT_BYTES.as_slice())
+            .await
+            .map_err(|_| FpError::invalid_protocol_data("upstream write failed"))?;
 
-    let client_settings = Http2Frame {
-        header: Http2FrameHeader {
-            length: 0,
-            frame_type: Http2FrameType::Settings,
-            flags: 0,
-            stream_id: Http2StreamId::connection(),
-        },
-        payload: Http2FramePayload::Settings {
-            ack: false,
-            settings: Http2Settings::new(Vec::new()),
-        },
-    };
-    write_http2_frame_async(upstream, &client_settings).await?;
+        let client_settings = Http2Frame {
+            header: Http2FrameHeader {
+                length: 0,
+                frame_type: Http2FrameType::Settings,
+                flags: 0,
+                stream_id: Http2StreamId::connection(),
+            },
+            payload: Http2FramePayload::Settings {
+                ack: false,
+                settings: Http2Settings::new(Vec::new()),
+            },
+        };
+        write_http2_frame_async(upstream, &client_settings).await?;
+    }
 
     let mut encoder =
         fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
             max_dynamic_table_size: 4096,
             use_huffman: false,
         });
-    let stream_id = Http2StreamId::new(1)
+    let stream_id = Http2StreamId::new(stream_id)
         .ok_or_else(|| FpError::internal("failed to allocate HTTP/2 stream id"))?;
     let request_frames =
         encode_http2_request_frames(&mut encoder, stream_id, request, authority, scheme)?;
@@ -1847,7 +2294,8 @@ async fn forward_http2_request(
         write_http2_frame_async(upstream, frame).await?;
     }
 
-    read_http2_response_async(upstream, stream_id, timeout).await
+    let response = read_http2_response_async(upstream, stream_id, timeout).await?;
+    Ok((response, stream_id.as_u32().saturating_add(2)))
 }
 
 async fn write_http2_frame_async(stream: &mut UpstreamIo, frame: &Http2Frame) -> FpResult<()> {
@@ -2338,6 +2786,35 @@ fn is_connection_specific_header(name: &str) -> bool {
     )
 }
 
+fn http1_upstream_connection_reusable(request: &HttpRequest, response: &HttpResponse) -> bool {
+    if request
+        .headers
+        .get("Connection")
+        .or_else(|| request.headers.get("connection"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+    {
+        return false;
+    }
+    if response
+        .headers
+        .get("Connection")
+        .or_else(|| response.headers.get("connection"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("close"))
+    {
+        return false;
+    }
+    if response.status == Some(101) {
+        return false;
+    }
+    response.headers.contains_key("Content-Length")
+        || response.headers.contains_key("content-length")
+        || response
+            .headers
+            .get("Transfer-Encoding")
+            .or_else(|| response.headers.get("transfer-encoding"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+}
+
 impl DispatcherDeps for RuntimeDeps {
     fn http1(&self) -> &dyn Http1RouterDeps {
         &self.http1
@@ -2399,6 +2876,7 @@ struct Http2Deps {
     next_connection_id: Arc<AtomicU64>,
     connection_id: ConnectionId,
     runtime_fingerprinting_result: FingerprintComputationResult,
+    runtime_stats: Arc<RuntimeStatsRegistry>,
     fingerprinting_stats: FingerprintingStatsIntegration,
     connection_stats: ConnectionStatsIntegration,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
@@ -2438,6 +2916,7 @@ impl Http2Deps {
             next_connection_id,
             connection_id,
             runtime_fingerprinting_result: missing_fingerprinting_result(SystemTime::UNIX_EPOCH),
+            runtime_stats: Arc::clone(&runtime_stats),
             fingerprinting_stats: FingerprintingStatsIntegration::new(Arc::clone(&runtime_stats)),
             connection_stats: connection_stats_integration(runtime_stats),
             dynamic_config_state,
@@ -2467,6 +2946,7 @@ impl Http2Deps {
             next_connection_id: Arc::clone(&self.next_connection_id),
             connection_id: ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed)),
             runtime_fingerprinting_result: self.runtime_fingerprinting_result.clone(),
+            runtime_stats: Arc::clone(&self.runtime_stats),
             fingerprinting_stats: self.fingerprinting_stats.clone(),
             connection_stats: self.connection_stats.clone(),
             dynamic_config_state: self.dynamic_config_state.clone(),
@@ -2544,6 +3024,22 @@ impl Http2Deps {
         select_virtual_host(domain, self.tls_sni.as_deref(), self.local_addr)
     }
 
+    fn finalize_http2_response(
+        &self,
+        ctx: &mut RequestContext,
+        response: HttpResponse,
+    ) -> FpResult<HttpResponse> {
+        ctx.response = response;
+        self.pipeline
+            .execute(ctx, ProcessingStage::Response)
+            .map_err(|e| e.error)?;
+        Ok(ctx.response.clone())
+    }
+
+    fn record_pooling_event(&self, event: PoolingEvent) {
+        self.runtime_stats.record_pooling_event(unix_now(), event);
+    }
+
     async fn forward_http2_continued(&self, mut ctx: RequestContext) -> FpResult<HttpResponse> {
         ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http2)?;
 
@@ -2612,24 +3108,68 @@ impl Http2Deps {
             fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Https => "https",
         };
 
-        let mut upstream = self
+        let acquired = match self
             .upstream_connection_manager
-            .connect_http2(&vhost.upstream.host, vhost.upstream.port, transport)
+            .connect_http2_pooled(
+                &vhost.upstream.host,
+                vhost.upstream.port,
+                transport,
+                unix_now(),
+            )
             .await
-            .inspect_err(|_e| {
+        {
+            Ok(upstream) => upstream,
+            Err(e) => {
+                self.record_pooling_event(PoolingEvent::Http2AcquireStreamMiss);
                 self.connection_stats.record_upstream_error(unix_now());
-            })?;
-        let upstream_resp = forward_http2_request(
+                if let Some(response) =
+                    upstream_failure_response_for_http2(UpstreamFailureStage::Connect, &e)
+                {
+                    return self.finalize_http2_response(&mut ctx, response);
+                }
+                return Err(e);
+            }
+        };
+        let (mut upstream, reused, stream_id) = acquired.into_parts();
+        self.record_pooling_event(if reused {
+            PoolingEvent::Http2AcquireStreamHit
+        } else {
+            PoolingEvent::Http2AcquireStreamMiss
+        });
+        let upstream_resp = match forward_http2_request(
             &mut upstream,
             &upstream_req,
             &vhost.upstream.host,
             scheme,
             DEFAULT_UPSTREAM_READ_TIMEOUT,
+            stream_id,
+            !reused,
         )
         .await
-        .inspect_err(|_e| {
-            self.connection_stats.record_upstream_error(unix_now());
-        })?;
+        {
+            Ok((response, next_stream_id)) => {
+                let _ = self
+                    .upstream_connection_manager
+                    .release_http2_connection_pooled(
+                        &vhost.upstream.host,
+                        vhost.upstream.port,
+                        transport,
+                        upstream,
+                        next_stream_id,
+                        unix_now(),
+                    );
+                response
+            }
+            Err(e) => {
+                self.connection_stats.record_upstream_error(unix_now());
+                if let Some(response) =
+                    upstream_failure_response_for_http2(UpstreamFailureStage::ResponseRead, &e)
+                {
+                    return self.finalize_http2_response(&mut ctx, response);
+                }
+                return Err(e);
+            }
+        };
         let upstream_resp = finalize_grpc_http2_response(&upstream_req, &upstream_resp)?;
 
         ctx.response = upstream_resp;
@@ -2913,6 +3453,80 @@ mod tests {
     use fingerprint_proxy_stats_api::time_windows::EffectiveTimeWindow;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DelayedFragmentClientStream {
+        inner: TcpStream,
+        first_write_limit: usize,
+        first_write_done: bool,
+        delay_done: bool,
+        delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl DelayedFragmentClientStream {
+        fn new(inner: TcpStream, first_write_limit: usize, delay: Duration) -> Self {
+            Self {
+                inner,
+                first_write_limit,
+                first_write_done: false,
+                delay_done: false,
+                delay: Box::pin(tokio::time::sleep(delay)),
+            }
+        }
+    }
+
+    impl AsyncRead for DelayedFragmentClientStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DelayedFragmentClientStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.first_write_done {
+                let len = self.first_write_limit.min(buf.len()).max(1);
+                return match std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[..len]) {
+                    std::task::Poll::Ready(Ok(n)) => {
+                        if n > 0 {
+                            self.first_write_done = true;
+                        }
+                        std::task::Poll::Ready(Ok(n))
+                    }
+                    other => other,
+                };
+            }
+
+            if !self.delay_done {
+                match std::future::Future::poll(self.delay.as_mut(), cx) {
+                    std::task::Poll::Ready(()) => self.delay_done = true,
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     fn ensure_domain_config_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3822,7 +4436,10 @@ kind = "reject"
             result.fingerprints.ja4t.availability,
             FingerprintAvailability::Complete
         );
-        assert!(result.fingerprints.ja4t.value.is_some());
+        assert_eq!(
+            result.fingerprints.ja4t.value.as_deref(),
+            Some("29200_2-4-8-1-3_1424_7")
+        );
         assert_eq!(result.fingerprints.ja4t.failure_reason, None);
 
         assert_eq!(
@@ -3833,6 +4450,30 @@ kind = "reject"
             result.fingerprints.ja4one.availability,
             FingerprintAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn runtime_connection_fingerprinting_marks_missing_tcp_option_order_as_partial() {
+        let peer = Some(SocketAddr::from(([192, 0, 2, 12], 43456)));
+        let local = Some(SocketAddr::from(([198, 51, 100, 22], 443)));
+
+        let result = compute_runtime_fingerprinting_result_for_connection(
+            peer,
+            local,
+            None,
+            Some(b"snd_wnd=29200;mss=1424;wscale=7".to_vec()),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(
+            result.fingerprints.ja4t.availability,
+            FingerprintAvailability::Partial
+        );
+        assert_eq!(
+            result.fingerprints.ja4t.value.as_deref(),
+            Some("29200__1424_7")
+        );
+        assert_eq!(result.fingerprints.ja4t.failure_reason, None);
     }
 
     #[test]
@@ -3954,6 +4595,59 @@ kind = "reject"
             .expect("seen request");
         let raw_s = String::from_utf8_lossy(&raw);
         assert_non_empty_http1_header(&raw_s, "X-JA4T");
+        assert_non_empty_http1_header(&raw_s, "X-JA4");
+        assert_non_empty_http1_header(&raw_s, "X-JA4One");
+
+        let _ = tls.shutdown().await;
+        let res = server_rx.await.expect("server result");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn http1_over_tls_computes_ja4_when_client_hello_is_fragmented_and_delayed() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        let (port_a, seen_req) = start_upstream_stub(response);
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pki = TestPki::generate();
+        let mut domain_config = make_domain_config_for_ports(port_a, port_default, https_port);
+        domain_config.virtual_hosts[0].tls.certificate.id = "example".to_string();
+        let (addr, server_rx) = run_server_once_with_pipeline_and_read_buf_and_domain_config(
+            runtime_builtin_pipeline(),
+            4096,
+            pki.bootstrap_config(),
+            domain_config,
+        )
+        .await;
+
+        let mut client_cfg = client_config(&pki.ca_cert_pem);
+        client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        let tcp = TcpStream::connect(addr).await.expect("connect proxy");
+        let fragmented_tcp = DelayedFragmentClientStream::new(tcp, 1, Duration::from_millis(75));
+        let server_name =
+            rustls::pki_types::ServerName::try_from("example.com").expect("server name");
+        let mut tls = connector
+            .connect(server_name, fragmented_tcp)
+            .await
+            .expect("tls connect");
+
+        tls.write_all(b"GET /fragmented-ja4 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("write request");
+
+        let mut responses = read_n_http1_responses(&mut tls, 1).await;
+        let (resp, _body) = responses.pop().expect("one response");
+        assert_eq!(resp.status, Some(200));
+
+        let raw = seen_req
+            .recv_timeout(Duration::from_secs(2))
+            .expect("seen request");
+        let raw_s = String::from_utf8_lossy(&raw);
         assert_non_empty_http1_header(&raw_s, "X-JA4");
         assert_non_empty_http1_header(&raw_s, "X-JA4One");
 
@@ -4248,6 +4942,46 @@ kind = "reject"
         (port, rx)
     }
 
+    fn start_keepalive_upstream_stub(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, std::sync::mpsc::Receiver<Vec<Vec<u8>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut tmp).expect("read");
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        break;
+                    }
+                }
+                requests.push(buf);
+                stream.write_all(&response).expect("write response");
+            }
+            let _ = tx.send(requests);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        (port, rx)
+    }
+
     fn start_upstream_h2c_stub(
         status: u16,
         headers: BTreeMap<String, String>,
@@ -4273,6 +5007,86 @@ kind = "reject"
         .expect("encode response frames");
 
         start_upstream_h2c_stub_with_frames(frames)
+    }
+
+    fn encode_h2_response_for_stream(stream_id: u32, body: &[u8]) -> Vec<Http2Frame> {
+        let response = HttpResponse {
+            version: "HTTP/2".to_string(),
+            status: Some(200),
+            headers: BTreeMap::new(),
+            trailers: BTreeMap::new(),
+            body: body.to_vec(),
+        };
+        let mut encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        fingerprint_proxy_http2::encode_http2_response_frames(
+            &mut encoder,
+            StreamId::new(stream_id).expect("stream id"),
+            &response,
+        )
+        .expect("encode response frames")
+    }
+
+    fn start_upstream_h2c_keepalive_stub() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut tmp).expect("read first h2 request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if h2_request_stream_completed(&buf, StreamId::new(1).expect("stream id")) {
+                    break;
+                }
+            }
+            let mut first_response = h2_settings_frame_bytes();
+            for frame in encode_h2_response_for_stream(1, b"one") {
+                first_response.extend_from_slice(
+                    &serialize_http2_frame(&frame).expect("serialize response frame"),
+                );
+            }
+            stream
+                .write_all(&first_response)
+                .expect("write first h2 response");
+
+            loop {
+                let n = stream.read(&mut tmp).expect("read second h2 request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if h2_request_stream_completed(&buf, StreamId::new(3).expect("stream id")) {
+                    break;
+                }
+            }
+            let mut second_response = Vec::new();
+            for frame in encode_h2_response_for_stream(3, b"two") {
+                second_response.extend_from_slice(
+                    &serialize_http2_frame(&frame).expect("serialize response frame"),
+                );
+            }
+            stream
+                .write_all(&second_response)
+                .expect("write second h2 response");
+            let _ = tx.send(buf);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        (port, rx)
     }
 
     fn start_upstream_h2c_stub_with_frames(
@@ -4422,6 +5236,11 @@ kind = "reject"
         port
     }
 
+    fn unused_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+        listener.local_addr().expect("local addr").port()
+    }
+
     fn make_domain_config_for_ports(
         port_a: u16,
         port_default: u16,
@@ -4528,6 +5347,93 @@ kind = "reject"
         }
     }
 
+    fn make_single_http_upstream_domain_config(
+        port: u16,
+    ) -> fingerprint_proxy_bootstrap_config::config::DomainConfig {
+        use fingerprint_proxy_bootstrap_config::config::*;
+
+        DomainConfig {
+            version: ConfigVersion::new("runtime-readiness-tests").expect("version"),
+            virtual_hosts: vec![VirtualHostConfig {
+                id: 1,
+                match_criteria: VirtualHostMatch {
+                    sni: Vec::new(),
+                    destination: Vec::new(),
+                },
+                tls: VirtualHostTlsConfig {
+                    certificate: CertificateRef {
+                        id: "default".to_string(),
+                    },
+                    minimum_tls_version: None,
+                    cipher_suites: Vec::new(),
+                },
+                upstream: UpstreamConfig {
+                    protocol: UpstreamProtocol::Http,
+                    allowed_upstream_app_protocols: None,
+                    host: "127.0.0.1".to_string(),
+                    port,
+                },
+                protocol: VirtualHostProtocolConfig {
+                    allow_http1: true,
+                    allow_http2: false,
+                    allow_http3: false,
+                },
+                module_config: BTreeMap::new(),
+            }],
+            fingerprint_headers: FingerprintHeaderConfig::default(),
+            client_classification_rules: Vec::new(),
+        }
+    }
+
+    fn start_readiness_reachable_upstream() -> u16 {
+        use std::net::{Shutdown, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind readiness upstream");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        port
+    }
+
+    fn closed_localhost_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    struct CountingReadinessChecker {
+        reachable: bool,
+        checks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingReadinessChecker {
+        fn new(reachable: bool) -> Self {
+            Self {
+                reachable,
+                checks: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn checks(&self) -> usize {
+            self.checks.load(Ordering::Relaxed)
+        }
+    }
+
+    impl UpstreamConnectivityChecker for CountingReadinessChecker {
+        fn check(&self, _target: &UpstreamValidationTarget) -> FpResult<()> {
+            self.checks.fetch_add(1, Ordering::Relaxed);
+            if self.reachable {
+                Ok(())
+            } else {
+                Err(FpError::validation_failed("test upstream unreachable"))
+            }
+        }
+    }
+
     #[test]
     fn new_connections_bind_latest_snapshot_while_existing_connections_keep_bound_snapshot() {
         let pipeline = Arc::new(runtime_builtin_pipeline());
@@ -4575,6 +5481,116 @@ kind = "reject"
         assert_eq!(second_revision, "runtime-tests-rev2");
     }
 
+    #[test]
+    fn readiness_upstream_cache_reuses_result_inside_ttl() {
+        let domain = make_single_http_upstream_domain_config(8080);
+        let checker = CountingReadinessChecker::new(true);
+        let cache = RuntimeReadinessUpstreamCache::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(1);
+
+        assert!(cache.upstreams_reachable(&domain, &checker, now, ttl));
+        assert!(cache.upstreams_reachable(&domain, &checker, now + Duration::from_millis(10), ttl));
+        assert_eq!(checker.checks(), 1);
+
+        assert!(cache.upstreams_reachable(
+            &domain,
+            &checker,
+            now + ttl + Duration::from_millis(1),
+            ttl
+        ));
+        assert_eq!(checker.checks(), 2);
+    }
+
+    #[test]
+    fn readiness_upstream_cache_is_scoped_by_config_revision() {
+        let mut revision_one = make_single_http_upstream_domain_config(8080);
+        revision_one.version = ConfigVersion::new("runtime-readiness-rev1").expect("rev1");
+        let mut revision_two = revision_one.clone();
+        revision_two.version = ConfigVersion::new("runtime-readiness-rev2").expect("rev2");
+        let checker = CountingReadinessChecker::new(true);
+        let cache = RuntimeReadinessUpstreamCache::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(1);
+
+        assert!(cache.upstreams_reachable(&revision_one, &checker, now, ttl));
+        assert!(cache.upstreams_reachable(
+            &revision_two,
+            &checker,
+            now + Duration::from_millis(10),
+            ttl
+        ));
+        assert_eq!(checker.checks(), 2);
+    }
+
+    #[test]
+    fn readiness_upstream_cache_preserves_unreachable_result_inside_ttl() {
+        let domain = make_single_http_upstream_domain_config(8080);
+        let checker = CountingReadinessChecker::new(false);
+        let cache = RuntimeReadinessUpstreamCache::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(1);
+
+        assert!(!cache.upstreams_reachable(&domain, &checker, now, ttl));
+        assert!(!cache.upstreams_reachable(
+            &domain,
+            &checker,
+            now + Duration::from_millis(10),
+            ttl
+        ));
+        assert_eq!(checker.checks(), 1);
+    }
+
+    #[tokio::test]
+    async fn http1_readiness_reports_ready_when_config_loaded_and_upstream_reachable() {
+        let upstream_port = start_readiness_reachable_upstream();
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_single_http_upstream_domain_config(upstream_port));
+
+        let req = HttpRequest::new("GET", "/health/ready", "HTTP/1.1");
+        let conn = deps.http1.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+            .await
+            .expect("health response");
+        assert_eq!(resp.status, Some(200));
+        assert_eq!(
+            std::str::from_utf8(&resp.body).expect("utf8"),
+            "{\"status\":\"ready\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http1_readiness_reports_not_ready_when_configured_upstream_unreachable() {
+        let upstream_port = closed_localhost_port();
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_single_http_upstream_domain_config(upstream_port));
+
+        let req = HttpRequest::new("GET", "/health/ready", "HTTP/1.1");
+        let conn = deps.http1.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+            .await
+            .expect("health response");
+        assert_eq!(resp.status, Some(503));
+        assert_eq!(
+            std::str::from_utf8(&resp.body).expect("utf8"),
+            "{\"status\":\"not_ready\",\"reason\":\"upstreams_unreachable\"}"
+        );
+    }
+
     #[tokio::test]
     async fn http1_continued_forwards_to_upstream_selected_by_sni_and_injects_fingerprint_headers()
     {
@@ -4619,6 +5635,118 @@ kind = "reject"
         assert!(raw
             .windows(b"X-JA4One: ja4one".len())
             .any(|w| w == b"X-JA4One: ja4one"));
+    }
+
+    #[tokio::test]
+    async fn http1_continued_reuses_safe_pooled_upstream_connection_and_records_stats() {
+        let (port, seen_requests) = start_keepalive_upstream_stub(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\none".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo".to_vec(),
+        ]);
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_domain_config_for_ports(port, port_default, https_port));
+        deps.http1.set_tls_sni(Some("example.com".to_string()));
+
+        for (id, path) in [(1, "/one"), (2, "/two")] {
+            let req = HttpRequest::new("GET", path, "HTTP/1.1");
+            let conn = deps.http1.new_connection(None, None);
+            let ctx = RequestContext::new(RequestId(id), conn, req);
+            let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+                .await
+                .expect("forward");
+            assert_eq!(resp.status, Some(200));
+        }
+
+        let requests = seen_requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("seen keepalive requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .windows(b"GET /one".len())
+            .any(|w| w == b"GET /one"));
+        assert!(requests[1]
+            .windows(b"GET /two".len())
+            .any(|w| w == b"GET /two"));
+
+        let counters = deps
+            .http1
+            .runtime_stats
+            .pooling_snapshot(&EffectiveTimeWindow {
+                from: 0,
+                to: u64::MAX,
+                window_seconds: u64::MAX,
+            });
+        assert_eq!(counters.http1_acquire_misses, 1);
+        assert_eq!(counters.http1_acquire_hits, 1);
+        assert_eq!(counters.http1_releases_pooled, 1);
+        assert_eq!(counters.http1_releases_discarded_not_reusable, 1);
+    }
+
+    #[tokio::test]
+    async fn http1_continued_retries_once_after_stale_pooled_connection_and_records_stats() {
+        let (port, seen_req) = start_upstream_stub(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        );
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_domain_config_for_ports(port, port_default, https_port));
+        deps.http1.set_tls_sni(Some("example.com".to_string()));
+
+        let (stale, peer) = tokio::io::duplex(8);
+        drop(peer);
+        assert_eq!(
+            deps.http1.upstream_connection_manager.release_http1_pooled(
+                "127.0.0.1",
+                port,
+                UpstreamTransportMode::Http,
+                Box::new(stale),
+                true,
+                unix_now(),
+            ),
+            Http1ReleaseOutcome::Pooled
+        );
+
+        let req = HttpRequest::new("GET", "/stale-retry", "HTTP/1.1");
+        let conn = deps.http1.new_connection(None, None);
+        let ctx = RequestContext::new(RequestId(1), conn, req);
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+            .await
+            .expect("forward after stale pooled connection");
+        assert_eq!(resp.status, Some(200));
+        assert_eq!(resp.body, b"ok");
+
+        let raw = seen_req
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fresh upstream request");
+        assert!(raw
+            .windows(b"GET /stale-retry".len())
+            .any(|w| w == b"GET /stale-retry"));
+
+        let counters = deps
+            .http1
+            .runtime_stats
+            .pooling_snapshot(&EffectiveTimeWindow {
+                from: 0,
+                to: u64::MAX,
+                window_seconds: u64::MAX,
+            });
+        assert_eq!(counters.http1_acquire_hits, 1);
+        assert_eq!(counters.http1_acquire_misses, 1);
+        assert_eq!(counters.http1_releases_pooled, 0);
+        assert_eq!(counters.http1_releases_discarded_not_reusable, 2);
     }
 
     #[tokio::test]
@@ -4709,6 +5837,136 @@ kind = "reject"
         assert!(request_headers
             .iter()
             .any(|f| f.name == "x-ja4one" && f.value == "ja4one"));
+    }
+
+    #[tokio::test]
+    async fn http2_continued_reuses_pooled_upstream_connection_and_records_stats() {
+        let (h2_port, seen_raw) = start_upstream_h2c_keepalive_stub();
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        let mut domain = make_domain_config_for_ports(h2_port, port_default, https_port);
+        domain.virtual_hosts[0].protocol.allow_http2 = true;
+        domain.virtual_hosts[0]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+        deps.http2.set_domain_config(domain);
+        deps.http2.set_tls_sni(Some("example.com".to_string()));
+
+        for (id, path, body) in [(1, "/h2-one", b"one"), (2, "/h2-two", b"two")] {
+            let req = HttpRequest::new("GET", path, "HTTP/2");
+            let conn = deps.http2.new_connection(None, None);
+            let ctx = RequestContext::new(RequestId(id), conn, req);
+            let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
+                .await
+                .expect("forward");
+            assert_eq!(resp.version, "HTTP/2");
+            assert_eq!(resp.status, Some(200));
+            assert_eq!(resp.body, body);
+        }
+
+        let raw = seen_raw
+            .recv_timeout(Duration::from_secs(2))
+            .expect("seen h2 requests");
+        assert_eq!(
+            raw.windows(ConnectionPreface::CLIENT_BYTES.len())
+                .filter(|w| *w == ConnectionPreface::CLIENT_BYTES.as_slice())
+                .count(),
+            1
+        );
+        assert!(h2_request_stream_completed(
+            &raw,
+            StreamId::new(1).expect("stream id")
+        ));
+        assert!(h2_request_stream_completed(
+            &raw,
+            StreamId::new(3).expect("stream id")
+        ));
+
+        let counters = deps
+            .http2
+            .runtime_stats
+            .pooling_snapshot(&EffectiveTimeWindow {
+                from: 0,
+                to: u64::MAX,
+                window_seconds: u64::MAX,
+            });
+        assert_eq!(counters.http2_stream_acquire_misses, 1);
+        assert_eq!(counters.http2_stream_acquire_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn http2_upstream_connect_failure_returns_503() {
+        let port = unused_local_port();
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        let mut domain = make_domain_config_for_ports(port, port_default, https_port);
+        domain.virtual_hosts[0].protocol.allow_http2 = true;
+        domain.virtual_hosts[0]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+        deps.http2.set_domain_config(domain);
+        deps.http2.set_tls_sni(Some("example.com".to_string()));
+
+        let req = HttpRequest::new("GET", "/h2-connect-fail", "HTTP/2");
+        let conn = deps.http2.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
+            .await
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/2");
+        assert_eq!(resp.status, Some(503));
+        assert_eq!(
+            resp.headers.get("content-length").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
+    async fn http2_upstream_read_timeout_returns_504() {
+        let port = start_upstream_stub_no_response();
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        let mut domain = make_domain_config_for_ports(port, port_default, https_port);
+        domain.virtual_hosts[0].protocol.allow_http2 = true;
+        domain.virtual_hosts[0]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+        deps.http2.set_domain_config(domain);
+        deps.http2.set_tls_sni(Some("example.com".to_string()));
+
+        let req = HttpRequest::new("GET", "/h2-timeout", "HTTP/2");
+        let conn = deps.http2.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
+            .await
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/2");
+        assert_eq!(resp.status, Some(504));
+        assert_eq!(
+            resp.headers.get("content-length").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[tokio::test]
@@ -4962,14 +6220,15 @@ kind = "reject"
         ctx.fingerprinting_result =
             Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
 
-        let err = forward_http2_continued_via_pipeline(&deps.http2, ctx)
+        let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
-            .expect_err("must fail");
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/2");
+        assert_eq!(resp.status, Some(502));
         assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
+            resp.headers.get("content-length").map(String::as_str),
+            Some("0")
         );
-        assert_eq!(err.message, "HTTP/2 invalid upstream CONTINUATION sequence");
     }
 
     #[tokio::test]
@@ -5410,6 +6669,71 @@ kind = "reject"
     }
 
     #[tokio::test]
+    async fn http1_upstream_connect_failure_returns_503() {
+        let port = unused_local_port();
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_domain_config_for_ports(port, port, port));
+        deps.http1.set_tls_sni(Some("example.com".to_string()));
+
+        let req = HttpRequest::new("GET", "/connect-fail", "HTTP/1.1");
+        let conn = deps.http1.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+            .await
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/1.1");
+        assert_eq!(resp.status, Some(503));
+        assert_eq!(
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            resp.headers.get("Connection").map(String::as_str),
+            Some("close")
+        );
+
+        let snapshot = deps.http1.runtime_stats.snapshot(&EffectiveTimeWindow {
+            from: 0,
+            to: u64::MAX,
+            window_seconds: u64::MAX,
+        });
+        assert_eq!(snapshot.system.upstream_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn http1_invalid_upstream_response_returns_502() {
+        let (port, _seen) = start_upstream_stub(b"not an http response\r\n\r\n".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1
+            .set_domain_config(make_domain_config_for_ports(port, port, port));
+        deps.http1.set_tls_sni(Some("example.com".to_string()));
+
+        let req = HttpRequest::new("GET", "/bad", "HTTP/1.1");
+        let conn = deps.http1.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+            .await
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/1.1");
+        assert_eq!(resp.status, Some(502));
+        assert_eq!(
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_read_timeout_is_deterministic() {
         let port = start_upstream_stub_no_response();
 
@@ -5425,14 +6749,15 @@ kind = "reject"
         ctx.fingerprinting_result =
             Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
 
-        let err = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
-            .expect_err("must error");
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/1.1");
+        assert_eq!(resp.status, Some(504));
         assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
         );
-        assert_eq!(err.message, "upstream read timed out");
     }
 
     #[tokio::test]
@@ -5453,14 +6778,15 @@ kind = "reject"
         ctx.fingerprinting_result =
             Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
 
-        let err = forward_http1_continued_via_pipeline(&deps.http1, ctx)
+        let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
-            .expect_err("must error");
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/1.1");
+        assert_eq!(resp.status, Some(502));
         assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
         );
-        assert_eq!(err.message, "upstream response headers too large");
     }
 
     #[tokio::test]
@@ -6059,6 +7385,77 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
     }
 
     #[tokio::test]
+    async fn websocket_invalid_upstream_handshake_returns_502_and_records_stats() {
+        let (port_a, _seen_req) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nd".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nh".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new(pipeline);
+        deps.http1.set_domain_config(make_domain_config_for_ports(
+            port_a,
+            port_default,
+            https_port,
+        ));
+        deps.http1.set_tls_sni(Some("example.com".to_string()));
+
+        let mut req = HttpRequest::new("GET", "/ws", "HTTP/1.1");
+        req.headers
+            .insert("Host".to_string(), "example.com".to_string());
+        req.headers
+            .insert("Upgrade".to_string(), "websocket".to_string());
+        req.headers
+            .insert("Connection".to_string(), "Upgrade".to_string());
+        req.headers.insert(
+            "Sec-WebSocket-Key".to_string(),
+            "dGhlIHNhbXBsZSBub25jZQ==".to_string(),
+        );
+        req.headers
+            .insert("Sec-WebSocket-Version".to_string(), "13".to_string());
+
+        let conn = deps.http1.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx.fingerprinting_result =
+            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        let pipeline_result = deps
+            .http1
+            .pipeline
+            .execute(&mut ctx, ProcessingStage::Request)
+            .map_err(|e| e.error)
+            .expect("request pipeline");
+        assert_eq!(pipeline_result.decision, ModuleDecision::Continue);
+
+        let (mut proxy_io, mut client_io) = tokio::io::duplex(4096);
+        deps.http1
+            .forward_websocket_continued(&mut proxy_io, ctx, Vec::new())
+            .await
+            .expect("mapped response");
+
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("read response");
+        let resp =
+            parse_http1_response(&buf[..n], Http1ParseOptions::default()).expect("parse response");
+        assert_eq!(resp.status, Some(502));
+        assert_eq!(
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
+        );
+
+        let snapshot = deps.http1.runtime_stats.snapshot(&EffectiveTimeWindow {
+            from: 0,
+            to: u64::MAX,
+            window_seconds: u64::MAX,
+        });
+        assert_eq!(snapshot.system.upstream_errors, 1);
+    }
+
+    #[tokio::test]
     async fn graceful_shutdown_allows_in_flight_connection_to_complete() {
         let pipeline = Pipeline::new(vec![Box::new(TerminateWithBodyModule {
             status: 200,
@@ -6145,10 +7542,13 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         let _ = tls.shutdown().await;
     }
 
-    async fn read_n_http1_responses(
-        tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    async fn read_n_http1_responses<IO>(
+        tls: &mut tokio_rustls::client::TlsStream<IO>,
         n: usize,
-    ) -> Vec<(HttpResponse, Vec<u8>)> {
+    ) -> Vec<(HttpResponse, Vec<u8>)>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
         let mut out = Vec::new();
         let mut buf = Vec::new();
         let mut tmp = [0u8; 64];

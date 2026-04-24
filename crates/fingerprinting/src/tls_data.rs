@@ -5,6 +5,7 @@ pub struct TlsClientHelloData {
     pub extensions: Vec<u16>,
     pub supported_versions: Option<Vec<u16>>,
     pub alpn_protocols: Vec<String>,
+    pub alpn_protocols_raw: Vec<Vec<u8>>,
     pub signature_algorithms: Option<Vec<u16>>,
     pub raw_client_hello: Vec<u8>,
 }
@@ -94,6 +95,7 @@ fn parse_client_hello_message(message: &[u8]) -> Option<TlsClientHelloData> {
     let mut extensions = Vec::new();
     let mut supported_versions = None;
     let mut alpn_protocols = Vec::new();
+    let mut alpn_protocols_raw = Vec::new();
     let mut signature_algorithms = None;
 
     if offset < body.len() {
@@ -111,7 +113,12 @@ fn parse_client_hello_message(message: &[u8]) -> Option<TlsClientHelloData> {
                     supported_versions = parse_supported_versions(extension_data);
                 }
                 0x0010 => {
-                    alpn_protocols = parse_alpn_protocols(extension_data).unwrap_or_default();
+                    alpn_protocols_raw =
+                        parse_alpn_protocols_raw(extension_data).unwrap_or_default();
+                    alpn_protocols = alpn_protocols_raw
+                        .iter()
+                        .map(|item| String::from_utf8_lossy(item).into_owned())
+                        .collect();
                 }
                 0x000d => {
                     signature_algorithms = parse_signature_algorithms(extension_data);
@@ -127,6 +134,7 @@ fn parse_client_hello_message(message: &[u8]) -> Option<TlsClientHelloData> {
         extensions,
         supported_versions,
         alpn_protocols,
+        alpn_protocols_raw,
         signature_algorithms,
         raw_client_hello: message.to_vec(),
     })
@@ -139,7 +147,7 @@ fn parse_supported_versions(data: &[u8]) -> Option<Vec<u16>> {
     parse_u16_vec(list)
 }
 
-fn parse_alpn_protocols(data: &[u8]) -> Option<Vec<String>> {
+fn parse_alpn_protocols_raw(data: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut offset = 0usize;
     let list_len = usize::from(read_u16(data, &mut offset)?);
     let list = read_slice(data, &mut offset, list_len)?;
@@ -149,7 +157,7 @@ fn parse_alpn_protocols(data: &[u8]) -> Option<Vec<String>> {
     while list_offset < list.len() {
         let item_len = usize::from(read_u8(list, &mut list_offset)?);
         let item = read_slice(list, &mut list_offset, item_len)?;
-        out.push(String::from_utf8_lossy(item).into_owned());
+        out.push(item.to_vec());
     }
     Some(out)
 }

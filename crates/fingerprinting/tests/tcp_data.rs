@@ -85,6 +85,12 @@ fn fallback_allow_empty_option_kinds_derives_deterministic_input() {
     assert!(input.option_kinds_in_order.is_empty());
     assert_eq!(input.mss, Some(1424));
     assert_eq!(input.window_scale, Some(7));
+
+    let fp = fingerprint_proxy_fingerprinting::compute_ja4t_fingerprint(
+        Some(&input),
+        SystemTime::UNIX_EPOCH,
+    );
+    assert_eq!(fp.availability, FingerprintAvailability::Partial);
 }
 
 #[test]
@@ -146,7 +152,7 @@ fn collector_uses_fallback_when_os_interface_lacks_option_order() {
     );
 
     assert_eq!(result.source, Some(TcpDataSource::Fallback));
-    assert_eq!(result.availability, FingerprintAvailability::Complete);
+    assert_eq!(result.availability, FingerprintAvailability::Partial);
     assert_eq!(result.issue, None);
     assert!(result
         .ja4t_input

@@ -1,6 +1,8 @@
 use crate::ipv6::{upstream_connect_target, upstream_tls_server_name};
 use crate::ipv6_routing::{connect_tcp_with_routing, AddressFamilyPreference};
-use crate::{FpError, FpResult};
+use crate::{
+    FpError, FpResult, UPSTREAM_TLS_H2_ALPN_MISMATCH_MESSAGE, UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE,
+};
 use std::sync::Arc;
 
 const ALPN_H2: &[u8] = b"h2";
@@ -61,13 +63,15 @@ impl Http2Connector {
                 let tls = connector
                     .connect(server_name.expect("validated for HTTPS"), tcp)
                     .await
-                    .map_err(|_| FpError::invalid_protocol_data("upstream TLS handshake failed"))?;
+                    .map_err(|_| {
+                        FpError::invalid_protocol_data(UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE)
+                    })?;
 
                 let (_tcp, conn) = tls.get_ref();
                 match conn.alpn_protocol() {
                     Some(proto) if proto == ALPN_H2 => Ok(Box::new(tls)),
                     _ => Err(FpError::invalid_protocol_data(
-                        "upstream TLS ALPN mismatch: expected h2",
+                        UPSTREAM_TLS_H2_ALPN_MISMATCH_MESSAGE,
                     )),
                 }
             }

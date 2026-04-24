@@ -149,6 +149,10 @@ fn partial_or_unavailable_does_not_inject_headers() {
     assert!(!prepared.headers.contains_key("X-JA4T"));
     assert!(!prepared.headers.contains_key("X-JA4"));
     assert!(!prepared.headers.contains_key("X-JA4One"));
+    assert!(
+        prepared.headers.is_empty(),
+        "partial or unavailable fingerprints must not create production or default debug headers"
+    );
 }
 
 #[test]

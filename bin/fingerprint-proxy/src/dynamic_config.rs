@@ -131,6 +131,7 @@ impl DynamicConfigUpdater {
         loaded_certs: Arc<LoadedTlsCertificates>,
         stats: Arc<RuntimeStatsRegistry>,
     ) -> FpResult<Self> {
+        validate_runtime_provider_kind(&provider_settings)?;
         let checker = TcpConnectUpstreamChecker::new(DEFAULT_UPSTREAM_CHECK_TIMEOUT)?;
         Ok(Self {
             provider_kind: provider_settings.kind,
@@ -425,6 +426,25 @@ impl DynamicConfigUpdater {
     }
 }
 
+fn validate_runtime_provider_kind(
+    provider_settings: &DynamicConfigProviderSettings,
+) -> FpResult<()> {
+    if provider_settings.kind.trim().is_empty() {
+        return Err(FpError::invalid_configuration(
+            "dynamic provider kind must be non-empty for active runtime dynamic configuration",
+        ));
+    }
+
+    if !provider_settings.is_supported_runtime_kind() {
+        return Err(FpError::invalid_configuration(format!(
+            "unsupported dynamic provider kind `{}`; only `file` is supported for active runtime dynamic configuration",
+            provider_settings.kind
+        )));
+    }
+
+    Ok(())
+}
+
 fn lock_poisoned_error(operation: &str) -> FpError {
     FpError::internal(format!(
         "dynamic snapshot store wrapper {operation} lock is poisoned"
@@ -541,6 +561,69 @@ mod tests {
             upstream_checker: Arc::new(PanicChecker),
             logger,
         }
+    }
+
+    #[test]
+    fn runtime_dynamic_updater_accepts_file_provider_kind() {
+        let updater = DynamicConfigUpdater::new_for_runtime(
+            DynamicConfigProviderSettings {
+                kind: "file".to_string(),
+            },
+            SharedDynamicConfigState::new(),
+            Arc::new(empty_loaded_tls_certificates()),
+            Arc::new(RuntimeStatsRegistry::new()),
+        )
+        .expect("file provider kind should be accepted");
+
+        assert_eq!(updater.provider_kind, "file");
+    }
+
+    #[test]
+    fn runtime_dynamic_updater_rejects_non_file_provider_kinds_before_retrieval() {
+        for kind in ["api", "db", "database", "unknown"] {
+            let result = DynamicConfigUpdater::new_for_runtime(
+                DynamicConfigProviderSettings {
+                    kind: kind.to_string(),
+                },
+                SharedDynamicConfigState::new(),
+                Arc::new(empty_loaded_tls_certificates()),
+                Arc::new(RuntimeStatsRegistry::new()),
+            );
+            let err = match result {
+                Ok(_) => panic!("non-file provider kind should fail runtime startup"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+            assert_eq!(
+                err.message,
+                format!(
+                    "unsupported dynamic provider kind `{kind}`; only `file` is supported for active runtime dynamic configuration"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_dynamic_updater_rejects_blank_provider_kind_before_retrieval() {
+        let result = DynamicConfigUpdater::new_for_runtime(
+            DynamicConfigProviderSettings {
+                kind: " ".to_string(),
+            },
+            SharedDynamicConfigState::new(),
+            Arc::new(empty_loaded_tls_certificates()),
+            Arc::new(RuntimeStatsRegistry::new()),
+        );
+        let err = match result {
+            Ok(_) => panic!("blank provider kind should fail runtime startup"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+        assert_eq!(
+            err.message,
+            "dynamic provider kind must be non-empty for active runtime dynamic configuration"
+        );
     }
 
     #[test]

@@ -19,9 +19,10 @@ provider implementation.
 
 ## Linux Runtime Contract
 
-`fingerprint-proxy` is a Linux-only runtime. Full `JA4T` support requires
-Linux kernel `4.3+`, because the proxy captures each accepted connection's
-saved SYN headers through `TCP_SAVE_SYN` / `TCP_SAVED_SYN`.
+`fingerprint-proxy` is a Linux-only runtime. Complete `JA4T` runtime support
+requires Linux kernel `4.3+` and ordered TCP option data from saved SYN headers
+through `TCP_SAVE_SYN` / `TCP_SAVED_SYN`. If ordered TCP option data is
+unavailable, JA4T is reported as partial or unavailable rather than complete.
 
 This is an inline runtime path, not a passive parallel sniffer. The proxy
 enables saved-SYN capture on its TCP listeners and reads the saved SYN headers
@@ -50,7 +51,8 @@ This is the normal mode for:
 
 In `direct_bind` mode, listener startup now depends on `TCP_SAVE_SYN`
 availability. If the kernel does not support saved SYN capture, startup fails
-explicitly instead of silently degrading `JA4T`.
+explicitly instead of silently degrading `JA4T`; complete JA4T still requires
+ordered TCP option data to be present in the captured saved SYN.
 
 Kubernetes should use the process-owned listener model. Service routing,
 readiness removal, pod replacement, and graceful termination are handled by the

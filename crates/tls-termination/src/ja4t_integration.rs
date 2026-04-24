@@ -55,7 +55,10 @@ fn availability(input: &Ja4TInput) -> FingerprintAvailability {
         return FingerprintAvailability::Unavailable;
     }
 
-    if input.mss.is_some() && input.window_scale.is_some() {
+    if !input.option_kinds_in_order.is_empty()
+        && input.mss.is_some()
+        && input.window_scale.is_some()
+    {
         FingerprintAvailability::Complete
     } else {
         FingerprintAvailability::Partial
@@ -92,21 +95,20 @@ fn parse_ja4t_input(raw_metadata: &[u8]) -> Result<Option<Ja4TInput>, ()> {
 
     let window_size = parse_optional_u16(&fields, &["snd_wnd", "window_size", "window"])?;
     let option_kinds_in_order =
-        parse_optional_option_kinds(&fields, &["tcp_options", "option_kinds"])?.unwrap_or_default();
+        parse_optional_option_kinds(&fields, &["tcp_options", "option_kinds"])?;
+    let has_option_kinds = option_kinds_in_order
+        .as_ref()
+        .is_some_and(|kinds| !kinds.is_empty());
     let mss = parse_optional_u16(&fields, &["mss"])?;
     let window_scale = parse_optional_u8(&fields, &["wscale", "window_scale", "scale"])?;
 
-    if window_size.is_none()
-        && mss.is_none()
-        && window_scale.is_none()
-        && option_kinds_in_order.is_empty()
-    {
+    if window_size.is_none() && mss.is_none() && window_scale.is_none() && !has_option_kinds {
         return Ok(None);
     }
 
     Ok(Some(Ja4TInput {
         window_size,
-        option_kinds_in_order,
+        option_kinds_in_order: option_kinds_in_order.unwrap_or_default(),
         mss,
         window_scale,
     }))

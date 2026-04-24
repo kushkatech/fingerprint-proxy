@@ -96,6 +96,14 @@ pub struct DynamicConfigProviderSettings {
     pub kind: String,
 }
 
+pub const FILE_DYNAMIC_PROVIDER_KIND: &str = "file";
+
+impl DynamicConfigProviderSettings {
+    pub fn is_supported_runtime_kind(&self) -> bool {
+        self.kind == FILE_DYNAMIC_PROVIDER_KIND
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainConfig {
     pub version: ConfigVersion,

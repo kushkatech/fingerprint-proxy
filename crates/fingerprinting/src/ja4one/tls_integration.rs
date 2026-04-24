@@ -79,6 +79,7 @@ mod tests {
             cipher_suites: Some(vec![0x1301, 0x1302]),
             extensions: Some(vec![0x0000, 0x0010]),
             alpn: Some(vec!["h2".to_string()]),
+            alpn_raw: None,
             signature_algorithms: Some(vec![0x0403]),
         }));
         assert_eq!(integrated.availability, FingerprintAvailability::Complete);

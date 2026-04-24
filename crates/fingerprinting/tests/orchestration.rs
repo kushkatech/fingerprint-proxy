@@ -34,6 +34,7 @@ fn example_ja4_inputs() -> (Ja4Input, Ja4OneInput) {
         cipher_suites: Some(vec![0x1301, 0x1302, 0x1303]),
         extensions: Some(vec![0x0000, 0x0010, 0x002b, 0x000d]),
         alpn: Some(vec!["h2".to_string()]),
+        alpn_raw: None,
         signature_algorithms: Some(vec![0x0403]),
     };
     let ja4one = Ja4OneInput {

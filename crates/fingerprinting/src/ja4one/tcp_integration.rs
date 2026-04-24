@@ -57,4 +57,17 @@ mod tests {
         assert!(integrated.has_window_size);
         assert_eq!(integrated.option_kinds_count, 5);
     }
+
+    #[test]
+    fn missing_tcp_option_order_maps_to_partial_component() {
+        let integrated = integrate_ja4t_component(Some(&Ja4TInput {
+            window_size: Some(29200),
+            option_kinds_in_order: vec![],
+            mss: Some(1424),
+            window_scale: Some(7),
+        }));
+        assert_eq!(integrated.availability, FingerprintAvailability::Partial);
+        assert!(integrated.has_window_size);
+        assert_eq!(integrated.option_kinds_count, 0);
+    }
 }

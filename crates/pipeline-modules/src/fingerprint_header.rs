@@ -125,6 +125,49 @@ mod tests {
     }
 
     #[test]
+    fn omits_partial_or_unavailable_fingerprints_without_status_headers() {
+        let mut ctx = make_ctx();
+        ctx.fingerprinting_result = Some(FingerprintComputationResult {
+            fingerprints: Fingerprints {
+                ja4t: Fingerprint {
+                    kind: FingerprintKind::Ja4T,
+                    availability: FingerprintAvailability::Partial,
+                    value: Some("partial-ja4t".to_string()),
+                    computed_at: Some(SystemTime::UNIX_EPOCH),
+                    failure_reason: None,
+                },
+                ja4: Fingerprint {
+                    kind: FingerprintKind::Ja4,
+                    availability: FingerprintAvailability::Unavailable,
+                    value: Some("unavailable-ja4".to_string()),
+                    computed_at: Some(SystemTime::UNIX_EPOCH),
+                    failure_reason: None,
+                },
+                ja4one: Fingerprint {
+                    kind: FingerprintKind::Ja4One,
+                    availability: FingerprintAvailability::Partial,
+                    value: None,
+                    computed_at: Some(SystemTime::UNIX_EPOCH),
+                    failure_reason: None,
+                },
+            },
+            metadata: FingerprintComputationMetadata {
+                computed_at: SystemTime::UNIX_EPOCH,
+                ja4one_components: None,
+            },
+        });
+
+        FingerprintHeaderModule::new()
+            .handle(&mut ctx)
+            .expect("inject");
+
+        assert!(
+            ctx.request.headers.is_empty(),
+            "partial or unavailable fingerprints must not create production or default debug headers"
+        );
+    }
+
+    #[test]
     fn uses_module_configured_header_names() {
         let mut ctx = make_ctx();
         let mut cfg = BTreeMap::new();

@@ -29,8 +29,9 @@ Implemented fingerprint families:
 - JA4T
 - JA4One
 
-Availability state is tracked so downstream consumers can distinguish complete,
-partial, and unavailable fingerprints.
+Availability state is tracked internally so production upstream headers expose
+only complete fingerprint values while partial and unavailable cases remain
+visible through diagnostics and statistics.
 
 ## Request Pipeline
 
@@ -38,7 +39,7 @@ The request pipeline uses deterministic built-in module registration. Current
 request-stage behavior includes:
 
 - client network classification;
-- fingerprint header injection;
+- complete-only fingerprint header injection;
 - continued forwarding control.
 
 Network classification uses ordered first-match CIDR rules. The current

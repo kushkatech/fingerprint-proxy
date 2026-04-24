@@ -24,6 +24,7 @@ pub fn build_runtime_fingerprinting_request(
                 cipher_suites: Some(tls.cipher_suites.clone()),
                 extensions: Some(tls.extensions.clone()),
                 alpn: Some(tls.alpn_protocols.clone()),
+                alpn_raw: Some(tls.alpn_protocols_raw.clone()),
                 signature_algorithms: tls.signature_algorithms.clone(),
             }),
             ja4one: Some(Ja4OneInput {

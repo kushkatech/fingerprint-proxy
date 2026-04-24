@@ -76,6 +76,30 @@ fn integration_preserves_existing_request_ja4t_input() {
 }
 
 #[test]
+fn integration_marks_missing_tcp_option_order_as_partial() {
+    let mut request = base_request();
+    request.tcp_metadata = Some(b"snd_wnd=29200;mss=1424;wscale=7".to_vec());
+
+    let outcome = integrate_ja4t_connection_data(&mut request);
+
+    assert_eq!(outcome.availability, FingerprintAvailability::Partial);
+    assert_eq!(
+        outcome.source,
+        Some(Ja4TIntegrationSource::ConnectionMetadata)
+    );
+    assert_eq!(outcome.issue, None);
+    assert_eq!(
+        request.inputs.ja4t,
+        Some(Ja4TInput {
+            window_size: Some(29200),
+            option_kinds_in_order: vec![],
+            mss: Some(1424),
+            window_scale: Some(7),
+        })
+    );
+}
+
+#[test]
 fn integration_non_tcp_transport_is_deterministically_unavailable() {
     let mut request = base_request();
     request.connection.transport = TransportHint::Quic;

@@ -1,0 +1,30 @@
+[
+  {
+    "_index": "packets-2003-06-11",
+    "_score": null,
+    "_source": {
+      "layers": {
+        "frame.number": [
+          "30"
+        ],
+        "ja4.ja4ssh": [
+          "c24s23_c4s4_c5s4"
+        ]
+      }
+    }
+  },
+  {
+    "_index": "packets-2003-06-11",
+    "_score": null,
+    "_source": {
+      "layers": {
+        "frame.number": [
+          "31"
+        ],
+        "ja4.ja4ssh": [
+          "c24s23_c4s4_c5s4"
+        ]
+      }
+    }
+  }
+]

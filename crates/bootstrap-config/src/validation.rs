@@ -115,6 +115,14 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
                 "bootstrap.dynamic_provider.kind",
                 "provider kind must be non-empty when dynamic provider is configured",
             ));
+        } else if !provider.is_supported_runtime_kind() {
+            report.push(ValidationIssue::error(
+                "bootstrap.dynamic_provider.kind",
+                format!(
+                    "unsupported dynamic provider kind `{}`; only `file` is supported for active runtime dynamic configuration",
+                    provider.kind
+                ),
+            ));
         }
     }
 

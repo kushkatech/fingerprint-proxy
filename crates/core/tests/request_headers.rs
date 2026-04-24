@@ -113,6 +113,10 @@ fn does_not_inject_partial_or_unavailable() {
     assert!(!req.headers.contains_key("X-JA4T"));
     assert!(!req.headers.contains_key("X-JA4"));
     assert!(!req.headers.contains_key("X-JA4One"));
+    assert!(
+        req.headers.is_empty(),
+        "partial or unavailable fingerprints must not create production or default debug headers"
+    );
 }
 
 #[test]

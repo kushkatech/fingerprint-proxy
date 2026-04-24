@@ -69,6 +69,7 @@ pub fn compute_ja4_fingerprint(input: Option<&Ja4Input>, computed_at: SystemTime
         cipher_suites,
         extensions,
         input.alpn.as_deref(),
+        input.alpn_raw.as_deref(),
         input.signature_algorithms.as_deref(),
     );
 
@@ -86,9 +87,10 @@ fn compute_ja4_string(
     cipher_suites: &[u16],
     extensions: &[u16],
     alpn: Option<&[String]>,
+    alpn_raw: Option<&[Vec<u8>]>,
     signature_algorithms: Option<&[u16]>,
 ) -> String {
-    let ja4_a = compute_a_part(version, cipher_suites, extensions, alpn);
+    let ja4_a = compute_a_part(version, cipher_suites, extensions, alpn, alpn_raw);
     let ja4_b = compute_b_part(cipher_suites);
     let ja4_c = compute_c_part(extensions, signature_algorithms.unwrap_or_default());
     format!("{ja4_a}_{ja4_b}_{ja4_c}")
@@ -99,6 +101,7 @@ fn compute_a_part(
     cipher_suites: &[u16],
     extensions: &[u16],
     alpn: Option<&[String]>,
+    alpn_raw: Option<&[Vec<u8>]>,
 ) -> String {
     let protocol = 't';
     let version_part = tls_version_to_part(version);
@@ -125,7 +128,7 @@ fn compute_a_part(
         99,
     );
 
-    let alpn_first2 = alpn_first2(alpn.and_then(|v| v.first().map(String::as_str)));
+    let alpn_first2 = alpn_indicator(alpn, alpn_raw);
     format!("{protocol}{version_part}{sni_flag}{cipher_count:02}{ext_count:02}{alpn_first2}")
 }
 
@@ -193,23 +196,44 @@ fn tls_version_to_part(version: u16) -> &'static str {
     }
 }
 
-fn alpn_first2(first_alpn: Option<&str>) -> String {
-    let Some(first_alpn) = first_alpn else {
-        return "00".to_string();
-    };
-    let bytes = first_alpn.as_bytes();
+fn alpn_indicator(alpn: Option<&[String]>, alpn_raw: Option<&[Vec<u8>]>) -> String {
+    if let Some(raw) = alpn_raw.and_then(|values| values.first()) {
+        return alpn_indicator_from_bytes(raw);
+    }
+    alpn.and_then(|values| values.first())
+        .map(|value| alpn_indicator_from_bytes(value.as_bytes()))
+        .unwrap_or_else(|| "00".to_string())
+}
+
+fn alpn_indicator_from_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "00".to_string();
     }
-    let first = bytes[0];
-    let second = bytes.get(1).copied().unwrap_or(first);
-    if !first.is_ascii() || !second.is_ascii() {
-        return "00".to_string();
+
+    let Some(first_index) = bytes.iter().position(|byte| byte.is_ascii_alphanumeric()) else {
+        return alpn_hex_fallback(bytes);
+    };
+    let Some(last_index) = bytes.iter().rposition(|byte| byte.is_ascii_alphanumeric()) else {
+        return alpn_hex_fallback(bytes);
+    };
+
+    if first_index != 0 || last_index != bytes.len() - 1 {
+        return alpn_hex_fallback(bytes);
     }
+
+    let first = bytes[first_index];
+    let last = bytes[last_index];
     let mut out = String::with_capacity(2);
     out.push(first as char);
-    out.push(second as char);
+    out.push(last as char);
     out
+}
+
+fn alpn_hex_fallback(bytes: &[u8]) -> String {
+    let hex = hex_lower(bytes);
+    let first = hex.as_bytes()[0] as char;
+    let last = hex.as_bytes()[hex.len() - 1] as char;
+    format!("{first}{last}")
 }
 
 fn is_grease(value: u16) -> bool {

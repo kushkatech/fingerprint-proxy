@@ -86,6 +86,19 @@ impl<H1: KeepAliveConnection, H2> PerUpstreamPools<H1, H2> {
         false
     }
 
+    pub fn take_idle_http2_connection(
+        &mut self,
+        key: &UpstreamPoolKey,
+        now_unix: u64,
+    ) -> Option<Http2PooledConnection<H2>> {
+        self.evict_http2_if_expired(key, now_unix);
+        let taken = self.pools.take_idle_http2_connection(key);
+        if taken.is_some() {
+            self.http2_last_touched.remove(key);
+        }
+        taken
+    }
+
     pub fn evict_expired(&mut self, now_unix: u64) -> EvictedCounts {
         let mut evicted = EvictedCounts::default();
 

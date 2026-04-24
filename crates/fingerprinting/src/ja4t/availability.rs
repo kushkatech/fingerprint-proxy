@@ -6,7 +6,10 @@ pub fn availability(input: &Ja4TInput) -> FingerprintAvailability {
         return FingerprintAvailability::Unavailable;
     }
 
-    if input.mss.is_some() && input.window_scale.is_some() {
+    if !input.option_kinds_in_order.is_empty()
+        && input.mss.is_some()
+        && input.window_scale.is_some()
+    {
         FingerprintAvailability::Complete
     } else {
         FingerprintAvailability::Partial

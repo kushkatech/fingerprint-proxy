@@ -139,9 +139,7 @@ fn start_http_stub(body: &'static str, expected_requests: usize) -> u16 {
                 body.len(),
                 body
             );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
+            let _ = stream.write_all(response.as_bytes());
         }
     });
 
@@ -237,7 +235,7 @@ async fn send_https_request(
 async fn health_endpoints_serve_and_runtime_continues_forwarding_requests() {
     let pki = TestPki::generate();
     let listener_port = reserve_local_port();
-    let upstream_port = start_http_stub("upstream-ok", 1);
+    let upstream_port = start_http_stub("upstream-ok", 2);
 
     let bootstrap = format!(
         r#"

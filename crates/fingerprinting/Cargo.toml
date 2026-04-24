@@ -14,3 +14,4 @@ sha2 = "0.10.8"
 
 [dev-dependencies]
 fingerprint-proxy-stats-api = { path = "../stats-api" }
+serde_json = "1.0.143"

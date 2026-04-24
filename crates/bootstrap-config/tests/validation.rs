@@ -5,6 +5,35 @@ use fingerprint_proxy_bootstrap_config::validation::{
 use fingerprint_proxy_core::identifiers::ConfigVersion;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+fn valid_bootstrap_config(
+    dynamic_provider: Option<DynamicConfigProviderSettings>,
+) -> BootstrapConfig {
+    BootstrapConfig {
+        listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+        listeners: vec![ListenerConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 443)),
+        }],
+        tls_certificates: vec![],
+        default_certificate_policy: DefaultCertificatePolicy::Reject,
+        dynamic_provider,
+        stats_api: StatsApiConfig {
+            enabled: false,
+            bind: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            network_policy: StatsApiNetworkPolicy::RequireAllowlist(vec![]),
+            auth_policy: StatsApiAuthPolicy::RequireCredentials(vec![]),
+        },
+        timeouts: SystemTimeouts {
+            upstream_connect_timeout: None,
+            request_timeout: None,
+        },
+        limits: SystemLimits {
+            max_header_bytes: None,
+            max_body_bytes: None,
+        },
+        module_enabled: Default::default(),
+    }
+}
+
 #[test]
 fn bootstrap_requires_at_least_one_listener() {
     let config = BootstrapConfig {
@@ -131,6 +160,53 @@ fn bootstrap_inherited_systemd_rejects_configured_listeners() {
         .issues
         .iter()
         .any(|i| i.message == "listeners must be empty in inherited_systemd mode"));
+}
+
+#[test]
+fn bootstrap_dynamic_provider_accepts_file_kind() {
+    let config = valid_bootstrap_config(Some(DynamicConfigProviderSettings {
+        kind: FILE_DYNAMIC_PROVIDER_KIND.to_string(),
+    }));
+
+    let report = validate_bootstrap_config(&config);
+
+    assert!(!report.has_errors(), "{report}");
+}
+
+#[test]
+fn bootstrap_dynamic_provider_rejects_non_file_kinds() {
+    for kind in ["api", "db", "database", "unknown"] {
+        let config = valid_bootstrap_config(Some(DynamicConfigProviderSettings {
+            kind: kind.to_string(),
+        }));
+
+        let report = validate_bootstrap_config(&config);
+
+        assert!(report.has_errors(), "{kind} should fail validation");
+        assert!(report.issues.iter().any(|issue| {
+            issue.path == "bootstrap.dynamic_provider.kind"
+                && issue.message
+                    == format!(
+                        "unsupported dynamic provider kind `{kind}`; only `file` is supported for active runtime dynamic configuration"
+                    )
+        }));
+    }
+}
+
+#[test]
+fn bootstrap_dynamic_provider_rejects_blank_kind() {
+    let config = valid_bootstrap_config(Some(DynamicConfigProviderSettings {
+        kind: " ".to_string(),
+    }));
+
+    let report = validate_bootstrap_config(&config);
+
+    assert!(report.has_errors());
+    assert!(report.issues.iter().any(|issue| {
+        issue.path == "bootstrap.dynamic_provider.kind"
+            && issue.message
+                == "provider kind must be non-empty when dynamic provider is configured"
+    }));
 }
 
 #[test]

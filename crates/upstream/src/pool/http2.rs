@@ -125,6 +125,14 @@ impl<C> Http2ConnectionPool<C> {
             .is_some_and(Http2PooledConnection::release_stream)
     }
 
+    pub fn take_idle_connection(&mut self) -> Option<Http2PooledConnection<C>> {
+        let connection_index = self
+            .connections
+            .iter()
+            .position(|connection| connection.active_streams() == 0 && connection.has_capacity())?;
+        Some(self.connections.remove(connection_index))
+    }
+
     pub fn connection(&self, connection_index: usize) -> Option<&Http2PooledConnection<C>> {
         self.connections.get(connection_index)
     }

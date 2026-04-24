@@ -1,5 +1,5 @@
 use crate::ipv6::normalize_upstream_host;
-use crate::{FpError, FpResult};
+use crate::{FpError, FpResult, UPSTREAM_CONNECT_FAILED_MESSAGE};
 use fingerprint_proxy_core::ipv6_mapped::normalize_ipv6_mapped_socket_addr;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
@@ -51,12 +51,14 @@ pub async fn connect_tcp_with_routing(
     } else {
         let resolved = tokio::net::lookup_host((normalized_host.as_str(), upstream_port))
             .await
-            .map_err(|_| FpError::invalid_protocol_data("upstream connect failed"))?;
+            .map_err(|_| FpError::invalid_protocol_data(UPSTREAM_CONNECT_FAILED_MESSAGE))?;
         ordered_candidate_routes(resolved.collect(), preference)
     };
 
     if candidates.is_empty() {
-        return Err(FpError::invalid_protocol_data("upstream connect failed"));
+        return Err(FpError::invalid_protocol_data(
+            UPSTREAM_CONNECT_FAILED_MESSAGE,
+        ));
     }
 
     for candidate in candidates {
@@ -65,7 +67,9 @@ pub async fn connect_tcp_with_routing(
         }
     }
 
-    Err(FpError::invalid_protocol_data("upstream connect failed"))
+    Err(FpError::invalid_protocol_data(
+        UPSTREAM_CONNECT_FAILED_MESSAGE,
+    ))
 }
 
 #[cfg(test)]

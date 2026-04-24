@@ -121,6 +121,15 @@ impl<H1: KeepAliveConnection, H2> ConnectionPoolManager<H1, H2> {
             .is_some_and(|pool| pool.release_stream(handle.lease))
     }
 
+    pub fn take_idle_http2_connection(
+        &mut self,
+        key: &UpstreamPoolKey,
+    ) -> Option<Http2PooledConnection<H2>> {
+        self.http2_pools
+            .get_mut(key)
+            .and_then(Http2ConnectionPool::take_idle_connection)
+    }
+
     pub fn http1_idle_count(&self, key: &UpstreamPoolKey) -> usize {
         self.http1_pools
             .get(key)

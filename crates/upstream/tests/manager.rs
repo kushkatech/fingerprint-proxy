@@ -1,8 +1,10 @@
 use fingerprint_proxy_core::error::ErrorKind;
 use fingerprint_proxy_upstream::http2::{BoxedUpstreamIo, UpstreamTransport};
 use fingerprint_proxy_upstream::manager::UpstreamConnectionManager;
+use fingerprint_proxy_upstream::pool::config::PoolSizeConfig;
 use fingerprint_proxy_upstream::pool::http1::Http1ReleaseOutcome;
 use fingerprint_proxy_upstream::pool::http2::Http2InsertOutcome;
+use fingerprint_proxy_upstream::pool::timeouts::PoolTimeoutConfig;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -153,10 +155,12 @@ async fn manager_http1_pooling_reuses_connection_for_same_upstream_key() {
 
     let manager = UpstreamConnectionManager::with_system_roots();
 
-    let mut first = manager
+    let (mut first, reused) = manager
         .connect_http1_pooled("127.0.0.1", addr.port(), UpstreamTransport::Http, 100)
         .await
-        .expect("first connect");
+        .expect("first connect")
+        .into_parts();
+    assert!(!reused);
     first.write_all(b"first").await.expect("write first");
     assert_eq!(
         manager.release_http1_pooled(
@@ -170,10 +174,12 @@ async fn manager_http1_pooling_reuses_connection_for_same_upstream_key() {
         Http1ReleaseOutcome::Pooled
     );
 
-    let mut second = manager
+    let (mut second, reused) = manager
         .connect_http1_pooled("127.0.0.1", addr.port(), UpstreamTransport::Http, 102)
         .await
-        .expect("second connect");
+        .expect("second connect")
+        .into_parts();
+    assert!(reused);
     second.write_all(b"second").await.expect("write second");
     assert_eq!(
         manager.release_http1_pooled(
@@ -210,10 +216,12 @@ async fn manager_http1_pooling_isolated_by_upstream_key() {
 
     let manager = UpstreamConnectionManager::with_system_roots();
 
-    let mut first = manager
+    let (mut first, reused) = manager
         .connect_http1_pooled("127.0.0.1", addr_a.port(), UpstreamTransport::Http, 10)
         .await
-        .expect("first connect");
+        .expect("first connect")
+        .into_parts();
+    assert!(!reused);
     first.write_all(b"a").await.expect("write a");
     let _ = manager.release_http1_pooled(
         "127.0.0.1",
@@ -224,10 +232,12 @@ async fn manager_http1_pooling_isolated_by_upstream_key() {
         11,
     );
 
-    let mut second = manager
+    let (mut second, reused) = manager
         .connect_http1_pooled("127.0.0.1", addr_b.port(), UpstreamTransport::Http, 12)
         .await
-        .expect("second connect");
+        .expect("second connect")
+        .into_parts();
+    assert!(!reused);
     second.write_all(b"b").await.expect("write b");
     let _ = manager.release_http1_pooled(
         "127.0.0.1",
@@ -315,4 +325,159 @@ async fn manager_http2_pooling_tracks_stream_leases_per_upstream() {
         .try_acquire_http2_stream_pooled("other.example.test", 443, UpstreamTransport::Https, 11)
         .expect("other stream lease");
     assert!(manager.release_http2_stream_pooled(other, 12));
+}
+
+#[tokio::test]
+async fn manager_http2_exclusive_checkout_takes_only_idle_connection_atomically() {
+    let manager = UpstreamConnectionManager::with_system_roots();
+    let make_io = || -> BoxedUpstreamIo {
+        let (a, _b) = tokio::io::duplex(64);
+        Box::new(a)
+    };
+
+    assert_eq!(
+        manager.insert_http2_connection_pooled(
+            "api.example.test",
+            443,
+            UpstreamTransport::Https,
+            make_io(),
+            2,
+            10
+        ),
+        Http2InsertOutcome::Inserted
+    );
+
+    let lease = manager
+        .try_acquire_http2_stream_pooled("api.example.test", 443, UpstreamTransport::Https, 11)
+        .expect("stream lease");
+    assert!(
+        manager
+            .take_idle_http2_connection_pooled(
+                "api.example.test",
+                443,
+                UpstreamTransport::Https,
+                12
+            )
+            .is_none(),
+        "exclusive checkout must not remove a connection with active stream state"
+    );
+    assert_eq!(
+        manager.pooled_http2_connection_count("api.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+    assert!(manager.release_http2_stream_pooled(lease, 13));
+
+    let (io, reused, next_stream_id) = manager
+        .take_idle_http2_connection_pooled("api.example.test", 443, UpstreamTransport::Https, 14)
+        .expect("exclusive checkout")
+        .into_parts();
+    assert!(reused);
+    assert_eq!(next_stream_id, 1);
+    assert_eq!(
+        manager.pooled_http2_connection_count("api.example.test", 443, UpstreamTransport::Https),
+        0
+    );
+    assert!(
+        manager
+            .take_idle_http2_connection_pooled(
+                "api.example.test",
+                443,
+                UpstreamTransport::Https,
+                15
+            )
+            .is_none(),
+        "exclusive checkout removes the idle connection under one lock"
+    );
+
+    assert_eq!(
+        manager.release_http2_connection_pooled(
+            "api.example.test",
+            443,
+            UpstreamTransport::Https,
+            io,
+            3,
+            16
+        ),
+        Http2InsertOutcome::Inserted
+    );
+    let (_io, reused, next_stream_id) = manager
+        .take_idle_http2_connection_pooled("api.example.test", 443, UpstreamTransport::Https, 17)
+        .expect("second exclusive checkout")
+        .into_parts();
+    assert!(reused);
+    assert_eq!(next_stream_id, 3);
+}
+
+#[tokio::test]
+async fn manager_http2_release_after_exclusive_checkout_reports_pool_full_without_corruption() {
+    let manager = UpstreamConnectionManager::new_with_pooling(
+        fingerprint_proxy_upstream::http2::default_tls_client_config(),
+        PoolSizeConfig::new(8, 1, 128).expect("pool size"),
+        PoolTimeoutConfig::default(),
+    )
+    .expect("manager");
+    let make_io = || -> BoxedUpstreamIo {
+        let (a, _b) = tokio::io::duplex(64);
+        Box::new(a)
+    };
+
+    assert_eq!(
+        manager.insert_http2_connection_pooled(
+            "api.example.test",
+            443,
+            UpstreamTransport::Https,
+            make_io(),
+            1,
+            10
+        ),
+        Http2InsertOutcome::Inserted
+    );
+
+    let (checked_out, reused, next_stream_id) = manager
+        .take_idle_http2_connection_pooled("api.example.test", 443, UpstreamTransport::Https, 11)
+        .expect("exclusive checkout")
+        .into_parts();
+    assert!(reused);
+    assert_eq!(next_stream_id, 1);
+    assert_eq!(
+        manager.pooled_http2_connection_count("api.example.test", 443, UpstreamTransport::Https),
+        0
+    );
+
+    assert_eq!(
+        manager.insert_http2_connection_pooled(
+            "api.example.test",
+            443,
+            UpstreamTransport::Https,
+            make_io(),
+            1,
+            12
+        ),
+        Http2InsertOutcome::Inserted
+    );
+    assert_eq!(
+        manager.release_http2_connection_pooled(
+            "api.example.test",
+            443,
+            UpstreamTransport::Https,
+            checked_out,
+            3,
+            13
+        ),
+        Http2InsertOutcome::RejectedPoolFull
+    );
+    assert_eq!(
+        manager.pooled_http2_connection_count("api.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+
+    let (_remaining, reused, next_stream_id) = manager
+        .take_idle_http2_connection_pooled("api.example.test", 443, UpstreamTransport::Https, 14)
+        .expect("remaining pool entry")
+        .into_parts();
+    assert!(reused);
+    assert_eq!(
+        next_stream_id, 1,
+        "pool-full release must drop the returned connection and keep the existing pooled entry"
+    );
 }
