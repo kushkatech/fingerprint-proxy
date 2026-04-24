@@ -1,0 +1,8 @@
+version = "v1"
+
+[[virtual_hosts]]
+id = 1
+match_criteria = { sni = [{ kind = "exact", value = "localhost" }], destination = [] }
+tls = { certificate = { id = "default" }, cipher_suites = [] }
+upstream = { protocol = "http", host = "backend", port = 5678 }
+protocol = { allow_http1 = true, allow_http2 = false, allow_http3 = false }

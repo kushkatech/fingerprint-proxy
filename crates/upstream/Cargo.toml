@@ -1,0 +1,19 @@
+[package]
+name = "fingerprint-proxy-upstream"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+rustls = "0.22"
+tokio = { version = "1", features = ["net", "time", "io-util"] }
+tokio-rustls = "0.25"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = "0.12"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

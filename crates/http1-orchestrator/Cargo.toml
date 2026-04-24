@@ -1,0 +1,18 @@
+[package]
+name = "fingerprint-proxy-http1-orchestrator"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-http1 = { path = "../http1" }
+fingerprint-proxy-pipeline = { path = "../pipeline" }
+fingerprint-proxy-prepipeline = { path = "../prepipeline" }
+fingerprint-proxy-websocket = { path = "../websocket" }
+
+[dev-dependencies]
+tokio = { version = "1.37.0", features = ["macros", "rt"] }

@@ -1,0 +1,24 @@
+[package]
+name = "fingerprint-proxy-tls-entry"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-tls-termination = { path = "../tls-termination" }
+fingerprint-proxy-http1-orchestrator = { path = "../http1-orchestrator" }
+fingerprint-proxy-http2-orchestrator = { path = "../http2-orchestrator" }
+fingerprint-proxy-http3-orchestrator = { path = "../http3-orchestrator" }
+fingerprint-proxy-http2 = { path = "../http2" }
+fingerprint-proxy-http3 = { path = "../http3" }
+
+[dev-dependencies]
+fingerprint-proxy-http1 = { path = "../http1" }
+fingerprint-proxy-hpack = { path = "../hpack" }
+fingerprint-proxy-pipeline = { path = "../pipeline" }
+fingerprint-proxy-prepipeline = { path = "../prepipeline" }
+tokio = { version = "1.37.0", features = ["macros", "rt"] }

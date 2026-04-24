@@ -1,0 +1,23 @@
+[package]
+name = "fingerprint-proxy-bootstrap-config"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-tls-termination = { path = "../tls-termination" }
+serde = { version = "=1.0.197", features = ["derive"] }
+toml = "=0.7.8"
+indexmap = "=2.2.6"
+rustls = "=0.22.4"
+rustls-pemfile = "=2.2.0"
+ring = "=0.17.14"
+x509-parser = { version = "=0.16.0", default-features = false }
+time = "=0.3.36"
+
+[dev-dependencies]
+rcgen = "=0.12.1"

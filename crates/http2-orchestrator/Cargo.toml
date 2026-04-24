@@ -1,0 +1,18 @@
+[package]
+name = "fingerprint-proxy-http2-orchestrator"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-hpack = { path = "../hpack" }
+fingerprint-proxy-http2 = { path = "../http2" }
+fingerprint-proxy-pipeline = { path = "../pipeline" }
+fingerprint-proxy-prepipeline = { path = "../prepipeline" }
+
+[dev-dependencies]
+tokio = { version = "1.37.0", features = ["macros", "rt"] }

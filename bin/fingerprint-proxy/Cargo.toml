@@ -1,0 +1,46 @@
+[package]
+name = "fingerprint-proxy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fingerprint-proxy"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../../crates/core" }
+fingerprint-proxy-fingerprinting = { path = "../../crates/fingerprinting" }
+fingerprint-proxy-tls-entry = { path = "../../crates/tls-entry" }
+fingerprint-proxy-tls-termination = { path = "../../crates/tls-termination" }
+fingerprint-proxy-http1-orchestrator = { path = "../../crates/http1-orchestrator" }
+fingerprint-proxy-http2-orchestrator = { path = "../../crates/http2-orchestrator" }
+fingerprint-proxy-http3-orchestrator = { path = "../../crates/http3-orchestrator" }
+fingerprint-proxy-http2 = { path = "../../crates/http2" }
+fingerprint-proxy-hpack = { path = "../../crates/hpack" }
+fingerprint-proxy-http3 = { path = "../../crates/http3" }
+fingerprint-proxy-quic = { path = "../../crates/quic" }
+fingerprint-proxy-pipeline = { path = "../../crates/pipeline" }
+fingerprint-proxy-pipeline-modules = { path = "../../crates/pipeline-modules" }
+fingerprint-proxy-prepipeline = { path = "../../crates/prepipeline" }
+fingerprint-proxy-bootstrap-config = { path = "../../crates/bootstrap-config" }
+fingerprint-proxy-http1 = { path = "../../crates/http1" }
+fingerprint-proxy-upstream = { path = "../../crates/upstream" }
+fingerprint-proxy-stats-api = { path = "../../crates/stats-api" }
+fingerprint-proxy-stats = { path = "../../crates/stats" }
+fingerprint-proxy-websocket = { path = "../../crates/websocket" }
+fingerprint-proxy-health = { path = "../../crates/health" }
+
+tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync", "signal"] }
+tokio-rustls = "0.25.0"
+rustls = "0.22.4"
+rustls-pemfile = "2.1.2"
+webpki-roots = "0.26.11"
+serde_json = "1.0"
+libc = "0.2"
+
+[dev-dependencies]
+rcgen = "=0.12.1"

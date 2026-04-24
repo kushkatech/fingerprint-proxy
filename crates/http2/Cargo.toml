@@ -1,0 +1,13 @@
+[package]
+name = "fingerprint-proxy-http2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-grpc = { path = "../grpc" }
+fingerprint-proxy-hpack = { path = "../hpack" }

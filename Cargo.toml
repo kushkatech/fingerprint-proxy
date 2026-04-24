@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+  "bin/fingerprint-proxy",
+  "crates/bootstrap-config",
+  "crates/core",
+  "crates/fingerprinting",
+  "crates/grpc",
+  "crates/health",
+  "crates/hpack",
+  "crates/http2",
+  "crates/http2-orchestrator",
+  "crates/http1",
+  "crates/http1-orchestrator",
+  "crates/http3",
+  "crates/http3-orchestrator",
+  "crates/integration-tests",
+  "crates/pipeline",
+  "crates/pipeline-modules",
+  "crates/prepipeline",
+  "crates/quic",
+  "crates/stats",
+  "crates/stats-api",
+  "crates/tls-entry",
+  "crates/tls-termination",
+  "crates/upstream",
+  "crates/websocket",
+]

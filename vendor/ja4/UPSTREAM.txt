@@ -1,0 +1,1 @@
+﻿Upstream: https://github.com/FoxIO-LLC/ja4\nCommit: fd06b598d8ddc465badf835e7e757017cb66ecf9\nFiles: technical_details/JA4.md, LICENSE\nFetched: 2026-01-03\n

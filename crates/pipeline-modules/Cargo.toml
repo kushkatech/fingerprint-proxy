@@ -1,0 +1,12 @@
+[package]
+name = "fingerprint-proxy-pipeline-modules"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-pipeline = { path = "../pipeline" }

@@ -1,0 +1,28 @@
+[package]
+name = "fingerprint-proxy-integration-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-grpc = { path = "../grpc" }
+fingerprint-proxy-hpack = { path = "../hpack" }
+fingerprint-proxy-http1-orchestrator = { path = "../http1-orchestrator" }
+fingerprint-proxy-http2 = { path = "../http2" }
+fingerprint-proxy-http2-orchestrator = { path = "../http2-orchestrator" }
+fingerprint-proxy-http3 = { path = "../http3" }
+fingerprint-proxy-http3-orchestrator = { path = "../http3-orchestrator" }
+fingerprint-proxy-pipeline = { path = "../pipeline" }
+fingerprint-proxy-prepipeline = { path = "../prepipeline" }
+fingerprint-proxy-tls-entry = { path = "../tls-entry" }
+fingerprint-proxy-upstream = { path = "../upstream" }
+rcgen = "=0.12.1"
+rustls = "0.22"
+rustls-pemfile = "2.2"
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio-rustls = "0.25"

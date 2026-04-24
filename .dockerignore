@@ -1,0 +1,9 @@
+/target
+**/target
+Cargo.lock
+.git
+.gitignore
+.claude
+.codex
+.cursor
+.vscode

@@ -1,0 +1,36 @@
+# Example dynamic domain configuration.
+#
+# Runtime requires FP_DOMAIN_CONFIG_PATH to point at this file when using the
+# file-backed dynamic configuration provider.
+
+version = "v1"
+
+[fingerprint_headers]
+ja4t_header = "X-JA4T"
+ja4_header = "X-JA4"
+ja4one_header = "X-JA4One"
+
+[[client_classification_rules]]
+name = "internal"
+cidrs = [
+  { addr = "10.0.0.0", prefix_len = 8 },
+  { addr = "172.16.0.0", prefix_len = 12 },
+  { addr = "192.168.0.0", prefix_len = 16 },
+  { addr = "fd00::", prefix_len = 8 },
+]
+
+[[client_classification_rules]]
+name = "local"
+cidrs = [
+  { addr = "127.0.0.0", prefix_len = 8 },
+  { addr = "::1", prefix_len = 128 },
+]
+
+[[virtual_hosts]]
+id = 1
+match_criteria = { sni = [{ kind = "exact", value = "example.com" }], destination = [] }
+tls = { certificate = { id = "default" }, minimum_tls_version = "tls13", cipher_suites = [] }
+upstream = { protocol = "https", allowed_upstream_app_protocols = ["http1", "http2"], host = "backend.example.internal", port = 443 }
+protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false }
+
+[virtual_hosts.module_config]
