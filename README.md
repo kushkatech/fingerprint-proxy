@@ -1,5 +1,9 @@
 # fingerprint-proxy
 
+> Active development notice:
+> This project is still under active development and is not intended for
+> production use yet.
+
 `fingerprint-proxy` is a TLS-terminating reverse proxy focused on client
 fingerprinting, request enrichment, and protocol-preserving upstream
 forwarding.
