@@ -1,8 +1,9 @@
 use crate::config::{
     BootstrapConfig, Cidr, Credential, DefaultCertificatePolicy, DynamicConfigProviderSettings,
     ListenerAcquisitionMode, ListenerConfig, StatsApiAuthPolicy, StatsApiConfig,
-    StatsApiNetworkPolicy, SystemLimits, SystemTimeouts,
+    StatsApiNetworkPolicy, SystemLimits, SystemTimeouts, DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
 };
+use crate::dynamic::upstream_check::UpstreamConnectivityValidationMode;
 use crate::provider::ConfigProvider;
 use crate::validation::validate_bootstrap_config;
 use crate::version_retrieval::VersionedConfig;
@@ -165,6 +166,22 @@ enum DefaultCertificatePolicyFile {
 #[derive(Debug, serde::Deserialize)]
 struct DynamicConfigProviderSettingsFile {
     kind: String,
+    #[serde(default = "default_dynamic_polling_interval_seconds")]
+    polling_interval_seconds: u64,
+    #[serde(default)]
+    upstream_connectivity_validation_mode: DynamicUpstreamConnectivityValidationModeFile,
+}
+
+fn default_dynamic_polling_interval_seconds() -> u64 {
+    DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum DynamicUpstreamConnectivityValidationModeFile {
+    #[default]
+    Disabled,
+    Strict,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -181,20 +198,25 @@ impl Default for StatsApiConfigFile {
         Self {
             enabled: false,
             bind: "127.0.0.1:0".parse().expect("default bind"),
-            network_policy: StatsApiNetworkPolicyFile::Disabled,
-            auth_policy: StatsApiAuthPolicyFile::Disabled,
+            network_policy: StatsApiNetworkPolicyFile::default(),
+            auth_policy: StatsApiAuthPolicyFile::default(),
         }
     }
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(tag = "kind")]
 enum StatsApiNetworkPolicyFile {
     #[serde(rename = "disabled")]
-    #[default]
     Disabled,
     #[serde(rename = "require_allowlist")]
     RequireAllowlist { allowlist: Vec<CidrFile> },
+}
+
+impl Default for StatsApiNetworkPolicyFile {
+    fn default() -> Self {
+        Self::RequireAllowlist { allowlist: vec![] }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -203,14 +225,21 @@ struct CidrFile {
     prefix_len: u8,
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(tag = "kind")]
 enum StatsApiAuthPolicyFile {
     #[serde(rename = "disabled")]
-    #[default]
     Disabled,
     #[serde(rename = "require_credentials")]
     RequireCredentials { bearer_tokens: Vec<String> },
+}
+
+impl Default for StatsApiAuthPolicyFile {
+    fn default() -> Self {
+        Self::RequireCredentials {
+            bearer_tokens: vec![],
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -249,14 +278,26 @@ pub fn load_bootstrap_config_from_file(path: impl AsRef<Path>) -> FpResult<Boots
         ))
     })?;
 
-    let file: BootstrapConfigFile = toml::from_str(&raw).map_err(|e| {
+    let config = parse_bootstrap_config_toml(&raw, &path.display().to_string())?;
+
+    let report = validate_bootstrap_config(&config);
+    if report.has_errors() {
+        return Err(FpError::validation_failed(format!(
+            "bootstrap config validation failed:\n{report}"
+        )));
+    }
+
+    Ok(config)
+}
+
+fn parse_bootstrap_config_toml(raw: &str, source: &str) -> FpResult<BootstrapConfig> {
+    let file: BootstrapConfigFile = toml::from_str(raw).map_err(|e| {
         FpError::invalid_configuration(format!(
-            "failed to parse bootstrap config as TOML {}: {e}",
-            path.display()
+            "failed to parse bootstrap config as TOML {source}: {e}"
         ))
     })?;
 
-    let config = BootstrapConfig {
+    Ok(BootstrapConfig {
         listener_acquisition_mode: match file.listener_acquisition_mode {
             ListenerAcquisitionModeFile::DirectBind => ListenerAcquisitionMode::DirectBind,
             ListenerAcquisitionModeFile::InheritedSystemd => {
@@ -297,7 +338,19 @@ pub fn load_bootstrap_config_from_file(path: impl AsRef<Path>) -> FpResult<Boots
         },
         dynamic_provider: file
             .dynamic_provider
-            .map(|p| DynamicConfigProviderSettings { kind: p.kind }),
+            .map(|p| DynamicConfigProviderSettings {
+                kind: p.kind,
+                polling_interval_seconds: p.polling_interval_seconds,
+                upstream_connectivity_validation_mode: match p.upstream_connectivity_validation_mode
+                {
+                    DynamicUpstreamConnectivityValidationModeFile::Disabled => {
+                        UpstreamConnectivityValidationMode::Disabled
+                    }
+                    DynamicUpstreamConnectivityValidationModeFile::Strict => {
+                        UpstreamConnectivityValidationMode::Strict
+                    }
+                },
+            }),
         stats_api: StatsApiConfig {
             enabled: file.stats_api.enabled,
             bind: file.stats_api.bind,
@@ -336,16 +389,7 @@ pub fn load_bootstrap_config_from_file(path: impl AsRef<Path>) -> FpResult<Boots
             max_body_bytes: file.limits.max_body_bytes,
         },
         module_enabled: file.module_enabled,
-    };
-
-    let report = validate_bootstrap_config(&config);
-    if report.has_errors() {
-        return Err(FpError::validation_failed(format!(
-            "bootstrap config validation failed:\n{report}"
-        )));
-    }
-
-    Ok(config)
+    })
 }
 
 fn parse_cidr(c: CidrFile) -> FpResult<Cidr> {
@@ -357,4 +401,60 @@ fn parse_cidr(c: CidrFile) -> FpResult<Cidr> {
         addr,
         prefix_len: c.prefix_len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabled_stats_api_omitted_policies_parse_to_required_empty_controls() {
+        let config = parse_bootstrap_config_toml(
+            r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[stats_api]
+enabled = true
+bind = "127.0.0.1:9000"
+"#,
+            "test",
+        )
+        .expect("parse bootstrap config");
+
+        assert_eq!(
+            config.stats_api.network_policy,
+            StatsApiNetworkPolicy::RequireAllowlist(vec![])
+        );
+        assert_eq!(
+            config.stats_api.auth_policy,
+            StatsApiAuthPolicy::RequireCredentials(vec![])
+        );
+    }
+
+    #[test]
+    fn enabled_stats_api_explicit_disabled_policies_parse_as_disabled() {
+        let config = parse_bootstrap_config_toml(
+            r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[stats_api]
+enabled = true
+bind = "127.0.0.1:9000"
+
+[stats_api.network_policy]
+kind = "disabled"
+
+[stats_api.auth_policy]
+kind = "disabled"
+"#,
+            "test",
+        )
+        .expect("parse bootstrap config");
+
+        assert_eq!(
+            config.stats_api.network_policy,
+            StatsApiNetworkPolicy::Disabled
+        );
+        assert_eq!(config.stats_api.auth_policy, StatsApiAuthPolicy::Disabled);
+    }
 }

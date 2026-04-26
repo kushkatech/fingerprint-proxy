@@ -11,19 +11,20 @@ use std::time::SystemTime;
 
 const MANIFEST: &str = include_str!("../../../testdata/ja4/corpus-manifest.psv");
 const RAW_CAPTURE_BASELINE: &str = include_str!("../../../testdata/ja4/raw-capture-baseline.psv");
+const UNSUPPORTED_ARTIFACT_BASELINE: &str =
+    include_str!("../../../testdata/ja4/unsupported-artifact-baseline.psv");
 const COMPARABLE_FIELDS: &[&str] = &["ja4", "ja4s"];
 const RUNTIME_COMPUTED_FIELD: &str = "ja4";
 
 const EXPECTED_RUNTIME_CAPTURE_VALIDATIONS: usize = 12;
 const EXPECTED_EXPECTED_DATA_COMPARISONS: usize = 15;
 const EXPECTED_EXPECTED_DATA_ARTIFACTS: usize = 30;
-const EXPECTED_UNSUPPORTED_CASES: usize = 62;
-const EXPECTED_UNSUPPORTED_REASONS: &[(&str, usize)] = &[
-    ("missing-comparable-expected-fields", 16),
-    ("non-tls-or-non-ja4-family-case", 32),
-    ("official-alpn-rule-conflicts-with-snapshot", 1),
-    ("no-supported-clienthello-ja4-expected-output", 6),
-    ("quic-runtime-not-in-scope", 7),
+const KNOWN_UNSUPPORTED_REASONS: &[&str] = &[
+    "missing-comparable-expected-fields",
+    "non-tls-or-non-ja4-family-case",
+    "official-alpn-rule-conflicts-with-snapshot",
+    "no-supported-clienthello-ja4-expected-output",
+    "quic-runtime-not-in-scope",
 ];
 
 #[test]
@@ -33,6 +34,11 @@ fn ja4_family_corpus_harness_accounts_for_supported_and_unsupported_cases() {
 
     let raw_baseline = raw_capture_baseline();
     assert_raw_capture_baseline_matches_manifest(&manifest, &raw_baseline);
+    let unsupported_baseline = unsupported_artifact_baseline(&manifest);
+    assert_raw_capture_unsupported_reasons_match_artifact_baseline(
+        &raw_baseline,
+        &unsupported_baseline,
+    );
 
     let expected_ja4 = load_snapshot_field_values(RUNTIME_COMPUTED_FIELD);
     let raw_validations = validate_supported_raw_captures(&raw_baseline, &expected_ja4);
@@ -67,8 +73,14 @@ fn ja4_family_corpus_harness_accounts_for_supported_and_unsupported_cases() {
         supported_artifacts.insert(validation.snapshot_manifest_path);
     }
 
-    let unsupported = unsupported_manifest_cases(&manifest, &supported_artifacts, &raw_baseline);
-    assert_eq!(unsupported.len(), EXPECTED_UNSUPPORTED_CASES);
+    let unsupported =
+        unsupported_manifest_cases(&manifest, &supported_artifacts, &unsupported_baseline)
+            .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(
+        unsupported.len(),
+        unsupported_baseline.len(),
+        "unsupported artifact accounting must be derived from the explicit baseline"
+    );
     assert!(
         !unsupported.is_empty(),
         "imported unsupported artifacts must be accounted explicitly"
@@ -76,10 +88,9 @@ fn ja4_family_corpus_harness_accounts_for_supported_and_unsupported_cases() {
     assert_unsupported_cases(&unsupported);
 
     let reason_counts = unsupported_reason_counts(&unsupported);
-    let expected: BTreeMap<&str, usize> = EXPECTED_UNSUPPORTED_REASONS.iter().copied().collect();
     assert_eq!(
         reason_counts,
-        expected,
+        unsupported_baseline_reason_counts(&unsupported_baseline),
         "unsupported bucket membership changed:\n{:#?}",
         unsupported_cases_by_reason(&unsupported)
     );
@@ -92,6 +103,88 @@ fn ja4_family_corpus_harness_accounts_for_supported_and_unsupported_cases() {
         unsupported.len(),
         reason_counts
     );
+}
+
+#[test]
+fn unsupported_artifact_baseline_rejects_duplicate_entries() {
+    let manifest_paths = BTreeSet::from(["testdata/ja4/pcap/example.pcap"]);
+    let err = parse_unsupported_artifact_baseline(
+        "relative_path|reason\n\
+         testdata/ja4/pcap/example.pcap|quic-runtime-not-in-scope\n\
+         testdata/ja4/pcap/example.pcap|quic-runtime-not-in-scope\n",
+        &manifest_paths,
+    )
+    .expect_err("duplicate artifact rows must fail");
+    assert!(err.contains("duplicate unsupported artifact baseline entry"));
+}
+
+#[test]
+fn unsupported_artifact_baseline_rejects_blank_or_unknown_reasons() {
+    let manifest_paths = BTreeSet::from([
+        "testdata/ja4/pcap/blank.pcap",
+        "testdata/ja4/pcap/unknown.pcap",
+    ]);
+
+    let blank = parse_unsupported_artifact_baseline(
+        "relative_path|reason\n\
+         testdata/ja4/pcap/blank.pcap|\n",
+        &manifest_paths,
+    )
+    .expect_err("blank reasons must fail");
+    assert!(blank.contains("reason must be known and non-blank"));
+
+    let unknown = parse_unsupported_artifact_baseline(
+        "relative_path|reason\n\
+         testdata/ja4/pcap/unknown.pcap|filename-derived-fallback\n",
+        &manifest_paths,
+    )
+    .expect_err("unknown reasons must fail");
+    assert!(unknown.contains("reason must be known and non-blank"));
+}
+
+#[test]
+fn unsupported_artifact_baseline_rejects_stale_entries() {
+    let manifest_paths = BTreeSet::from(["testdata/ja4/pcap/current.pcap"]);
+    let err = parse_unsupported_artifact_baseline(
+        "relative_path|reason\n\
+         testdata/ja4/pcap/stale.pcap|quic-runtime-not-in-scope\n",
+        &manifest_paths,
+    )
+    .expect_err("baseline rows without manifest artifacts must fail");
+    assert!(err.contains("not present in corpus manifest"));
+}
+
+#[test]
+fn unsupported_artifact_accounting_rejects_missing_baseline_rows() {
+    let manifest = [ManifestEntry {
+        relative_path: "testdata/ja4/pcap/missing.pcap",
+        size_bytes: 1,
+    }];
+    let supported_artifacts = BTreeSet::new();
+    let unsupported_baseline = BTreeMap::new();
+
+    let err = unsupported_manifest_cases(&manifest, &supported_artifacts, &unsupported_baseline)
+        .expect_err("unsupported manifest artifacts must have explicit baseline rows");
+    assert!(err.contains("unsupported artifact is missing from baseline"));
+}
+
+#[test]
+fn unsupported_artifact_accounting_rejects_supported_baseline_rows() {
+    let manifest = [ManifestEntry {
+        relative_path: "testdata/ja4/pcap/supported.pcap",
+        size_bytes: 1,
+    }];
+    let supported_artifacts = BTreeSet::from(["testdata/ja4/pcap/supported.pcap"]);
+    let unsupported_baseline = BTreeMap::from([(
+        "testdata/ja4/pcap/supported.pcap",
+        UnsupportedArtifactBaselineEntry {
+            reason: "quic-runtime-not-in-scope",
+        },
+    )]);
+
+    let err = unsupported_manifest_cases(&manifest, &supported_artifacts, &unsupported_baseline)
+        .expect_err("unsupported baseline rows must not survive after artifact support changes");
+    assert!(err.contains("unsupported artifact baseline entry is now supported"));
 }
 
 fn assert_manifest_paths_resolve(entries: &[ManifestEntry]) {
@@ -139,9 +232,7 @@ fn assert_unsupported_cases(cases: &[UnsupportedCase]) {
 }
 
 fn is_known_unsupported_reason(reason: &str) -> bool {
-    EXPECTED_UNSUPPORTED_REASONS
-        .iter()
-        .any(|(known, _)| *known == reason)
+    KNOWN_UNSUPPORTED_REASONS.contains(&reason)
 }
 
 fn validate_supported_raw_captures(
@@ -277,6 +368,91 @@ fn raw_capture_baseline() -> BTreeMap<&'static str, RawCaptureBaselineEntry> {
     out
 }
 
+fn unsupported_artifact_baseline(
+    manifest: &[ManifestEntry<'static>],
+) -> BTreeMap<&'static str, UnsupportedArtifactBaselineEntry<'static>> {
+    let manifest_paths = manifest
+        .iter()
+        .map(|entry| entry.relative_path)
+        .collect::<BTreeSet<_>>();
+    parse_unsupported_artifact_baseline(UNSUPPORTED_ARTIFACT_BASELINE, &manifest_paths)
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+fn parse_unsupported_artifact_baseline<'a>(
+    content: &'a str,
+    manifest_paths: &BTreeSet<&str>,
+) -> Result<BTreeMap<&'a str, UnsupportedArtifactBaselineEntry<'a>>, String> {
+    let mut lines = content.lines();
+    match lines.next() {
+        Some("relative_path|reason") => {}
+        other => {
+            return Err(format!(
+                "unsupported artifact baseline header changed: {other:?}"
+            ));
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for line in lines.filter(|line| !line.trim().is_empty()) {
+        let parts = line.split('|').collect::<Vec<_>>();
+        if parts.len() != 2 {
+            return Err(format!(
+                "unsupported artifact baseline line must have 2 fields: {line}"
+            ));
+        }
+        let relative_path = parts[0];
+        let reason = parts[1];
+        if relative_path.trim().is_empty() {
+            return Err(format!(
+                "unsupported artifact baseline path must be non-blank: {line}"
+            ));
+        }
+        if !is_known_unsupported_reason(reason) {
+            return Err(format!(
+                "unsupported artifact baseline reason must be known and non-blank: {relative_path} => {reason:?}"
+            ));
+        }
+        if !manifest_paths.contains(relative_path) {
+            return Err(format!(
+                "unsupported artifact baseline entry is not present in corpus manifest: {relative_path}"
+            ));
+        }
+        if out
+            .insert(relative_path, UnsupportedArtifactBaselineEntry { reason })
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate unsupported artifact baseline entry: {relative_path}"
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+fn assert_raw_capture_unsupported_reasons_match_artifact_baseline(
+    raw_baseline: &BTreeMap<&'static str, RawCaptureBaselineEntry>,
+    unsupported_baseline: &BTreeMap<&'static str, UnsupportedArtifactBaselineEntry<'static>>,
+) {
+    for (capture, entry) in raw_baseline {
+        let raw_path = raw_manifest_path(capture);
+        match entry.status {
+            RawCaptureStatus::Supported => assert!(
+                !unsupported_baseline.contains_key(raw_path),
+                "supported raw capture must not have an unsupported artifact baseline row: {raw_path}"
+            ),
+            RawCaptureStatus::Unsupported => assert_eq!(
+                unsupported_baseline
+                    .get(raw_path)
+                    .map(|unsupported| unsupported.reason),
+                Some(entry.reason),
+                "raw capture unsupported reason must match artifact baseline: {raw_path}"
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RawCaptureBaselineEntry {
     status: RawCaptureStatus,
@@ -287,6 +463,11 @@ struct RawCaptureBaselineEntry {
 enum RawCaptureStatus {
     Supported,
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnsupportedArtifactBaselineEntry<'a> {
+    reason: &'a str,
 }
 
 fn compute_ja4_values_from_capture(path: &Path) -> Result<Vec<String>, String> {
@@ -388,63 +569,48 @@ struct UnsupportedCase<'a> {
 fn unsupported_manifest_cases<'a>(
     entries: &'a [ManifestEntry<'static>],
     supported_artifacts: &BTreeSet<&'static str>,
-    raw_baseline: &BTreeMap<&'static str, RawCaptureBaselineEntry>,
-) -> Vec<UnsupportedCase<'a>> {
-    entries
-        .iter()
-        .filter(|entry| !supported_artifacts.contains(entry.relative_path))
-        .map(|entry| UnsupportedCase {
+    unsupported_baseline: &BTreeMap<&'static str, UnsupportedArtifactBaselineEntry<'static>>,
+) -> Result<Vec<UnsupportedCase<'a>>, String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        if supported_artifacts.contains(entry.relative_path) {
+            if unsupported_baseline.contains_key(entry.relative_path) {
+                return Err(format!(
+                    "unsupported artifact baseline entry is now supported: {}",
+                    entry.relative_path
+                ));
+            }
+            continue;
+        }
+
+        let Some(baseline) = unsupported_baseline.get(entry.relative_path) else {
+            return Err(format!(
+                "unsupported artifact is missing from baseline: {}",
+                entry.relative_path
+            ));
+        };
+        out.push(UnsupportedCase {
             relative_path: entry.relative_path,
-            reason: unsupported_reason(entry, raw_baseline),
-        })
-        .collect()
-}
-
-fn unsupported_reason(
-    entry: &ManifestEntry,
-    raw_baseline: &BTreeMap<&'static str, RawCaptureBaselineEntry>,
-) -> &'static str {
-    if let Some(capture) = entry.relative_path.strip_prefix("testdata/ja4/pcap/") {
-        return raw_baseline
-            .get(capture)
-            .unwrap_or_else(|| panic!("raw capture baseline should contain {capture}"))
-            .reason;
+            reason: baseline.reason,
+        });
     }
-
-    let name = entry
-        .relative_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(entry.relative_path);
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("tls-non-ascii-alpn") {
-        return "official-alpn-rule-conflicts-with-snapshot";
-    }
-
-    if lower.contains("dhcp")
-        || lower.contains("gre-")
-        || lower.contains("gtp-")
-        || lower.contains("ssh")
-        || lower.contains("tcpdump-geneve")
-    {
-        return "non-tls-or-non-ja4-family-case";
-    }
-
-    if lower.contains("quic") {
-        return "quic-runtime-not-in-scope";
-    }
-
-    if entry.relative_path.starts_with("testdata/ja4/pcap/") {
-        return "no-supported-clienthello-ja4-expected-output";
-    }
-
-    "missing-comparable-expected-fields"
+    Ok(out)
 }
 
 fn unsupported_reason_counts(cases: &[UnsupportedCase]) -> BTreeMap<&'static str, usize> {
     let mut reason_counts = BTreeMap::new();
     for case in cases {
         *reason_counts.entry(case.reason).or_insert(0usize) += 1;
+    }
+    reason_counts
+}
+
+fn unsupported_baseline_reason_counts(
+    unsupported_baseline: &BTreeMap<&'static str, UnsupportedArtifactBaselineEntry<'static>>,
+) -> BTreeMap<&'static str, usize> {
+    let mut reason_counts = BTreeMap::new();
+    for entry in unsupported_baseline.values() {
+        *reason_counts.entry(entry.reason).or_insert(0usize) += 1;
     }
     reason_counts
 }

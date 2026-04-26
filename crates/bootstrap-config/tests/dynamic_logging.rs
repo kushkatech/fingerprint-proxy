@@ -1,8 +1,9 @@
 use fingerprint_proxy_bootstrap_config::dynamic::logging::{
-    format_update_log_event, log_update_operation, UpdateLogEvent, UpdateOperation,
-    UpdateOperationLogger, UpdateOutcome,
+    format_update_log_event_with_timestamp, log_update_operation, structured_update_log_event,
+    UpdateLogEvent, UpdateOperation, UpdateOperationLogger, UpdateOutcome,
 };
 use fingerprint_proxy_bootstrap_config::versioning::ConfigRevisionId;
+use fingerprint_proxy_core::logging::LogLevel;
 use std::sync::{Arc, Mutex};
 
 fn revision_id(value: &str) -> ConfigRevisionId {
@@ -36,13 +37,35 @@ fn formatter_includes_operation_outcome_revisions_and_detail() {
     .with_active_revision(Some(revision_id("rev-1")))
     .with_candidate_revision(Some(revision_id("rev-2")));
 
-    let line = format_update_log_event(&event);
+    let line = format_update_log_event_with_timestamp(&event, 1710001234567);
 
-    assert!(line.contains("operation=activation"));
-    assert!(line.contains("outcome=succeeded"));
-    assert!(line.contains("active_revision=rev-1"));
-    assert!(line.contains("candidate_revision=rev-2"));
-    assert!(line.contains("detail=activated new snapshot"));
+    assert_eq!(
+        line,
+        "ts=1710001234567 level=INFO component=dynamic-config message=dynamic_config_update context={active_revision=rev-1,candidate_revision=rev-2,detail=activated new snapshot,operation=activation,outcome=succeeded}"
+    );
+}
+
+#[test]
+fn structured_update_log_event_preserves_categories_and_failure_level() {
+    let event = UpdateLogEvent::new(
+        UpdateOperation::Retrieval,
+        UpdateOutcome::Failed,
+        "failed to load domain config",
+    );
+
+    let structured = structured_update_log_event(&event, 1710001234567);
+
+    assert_eq!(structured.level, LogLevel::Warn);
+    assert_eq!(structured.component, "dynamic-config");
+    assert_eq!(structured.message, "dynamic_config_update");
+    assert_eq!(
+        structured.context.get("operation").map(String::as_str),
+        Some("retrieval")
+    );
+    assert_eq!(
+        structured.context.get("outcome").map(String::as_str),
+        Some("failed")
+    );
 }
 
 #[test]

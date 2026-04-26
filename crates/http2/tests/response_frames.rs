@@ -95,6 +95,42 @@ fn non_empty_body_emits_headers_then_data_with_end_stream_on_data() {
 }
 
 #[test]
+fn large_body_is_split_into_default_sized_data_frames_with_end_stream_on_final_data() {
+    let mut encoder = new_encoder();
+    let body: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+
+    let resp = HttpResponse {
+        status: Some(200),
+        body: body.clone(),
+        ..Default::default()
+    };
+
+    let stream_id = StreamId::new(1).unwrap();
+    let frames = encode_http2_response_frames(&mut encoder, stream_id, &resp).expect("encode");
+    assert_eq!(frames.len(), 4);
+    assert_eq!(frames[0].header.frame_type, FrameType::Headers);
+
+    let mut reassembled = Vec::new();
+    for (index, frame) in frames[1..].iter().enumerate() {
+        assert_eq!(frame.header.stream_id, stream_id);
+        assert_eq!(frame.header.frame_type, FrameType::Data);
+        assert!(frame.header.length <= 16_384);
+        assert_eq!(
+            frame.header.flags & 0x1,
+            if index == 2 { 0x1 } else { 0x0 },
+            "only the final DATA frame may end the stream"
+        );
+
+        let FramePayload::Data(bytes) = &frame.payload else {
+            panic!("expected DATA payload");
+        };
+        assert_eq!(frame.header.length as usize, bytes.len());
+        reassembled.extend_from_slice(bytes);
+    }
+    assert_eq!(reassembled, body);
+}
+
+#[test]
 fn stream_id_zero_is_invalid() {
     let mut encoder = new_encoder();
     let resp = HttpResponse {
@@ -151,6 +187,47 @@ fn headers_body_and_trailers_emit_headers_data_and_trailing_headers_with_end_str
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name, "x-trailer");
     assert_eq!(fields[0].value, "v");
+}
+
+#[test]
+fn large_body_with_trailers_splits_data_without_end_stream_and_ends_on_trailers() {
+    let mut encoder = new_encoder();
+    let stream_id = StreamId::new(1).unwrap();
+    let body: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+
+    let mut resp = HttpResponse {
+        status: Some(200),
+        body: body.clone(),
+        ..Default::default()
+    };
+    resp.trailers
+        .insert("x-trailer".to_string(), "v".to_string());
+
+    let frames = encode_http2_response_frames(&mut encoder, stream_id, &resp).expect("encode");
+    assert_eq!(frames.len(), 5);
+    assert_eq!(frames[0].header.frame_type, FrameType::Headers);
+
+    let mut reassembled = Vec::new();
+    for frame in &frames[1..4] {
+        assert_eq!(frame.header.frame_type, FrameType::Data);
+        assert!(frame.header.length <= 16_384);
+        assert_eq!(
+            frame.header.flags & 0x1,
+            0x0,
+            "DATA must not end stream when trailers are present"
+        );
+
+        let FramePayload::Data(bytes) = &frame.payload else {
+            panic!("expected DATA payload");
+        };
+        assert_eq!(frame.header.length as usize, bytes.len());
+        reassembled.extend_from_slice(bytes);
+    }
+    assert_eq!(reassembled, body);
+
+    assert_eq!(frames[4].header.frame_type, FrameType::Headers);
+    assert_eq!(frames[4].header.flags & 0x4, 0x4);
+    assert_eq!(frames[4].header.flags & 0x1, 0x1);
 }
 
 #[test]

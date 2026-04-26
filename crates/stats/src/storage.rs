@@ -22,9 +22,17 @@ impl InMemoryStatsStorage {
         guard.system.record_connection_closed();
     }
 
-    pub(crate) fn record_request(&self, at_unix: u64, result: &FingerprintComputationResult) {
+    pub(crate) fn record_request_processed(&self, at_unix: u64) {
         let mut guard = self.inner.lock().expect("runtime stats mutex poisoned");
         guard.system.record_request_processed(at_unix);
+    }
+
+    pub(crate) fn record_fingerprint_computation(
+        &self,
+        at_unix: u64,
+        result: &FingerprintComputationResult,
+    ) {
+        let mut guard = self.inner.lock().expect("runtime stats mutex poisoned");
         guard.ja4t.record(at_unix, &result.fingerprints.ja4t);
         guard.ja4.record(at_unix, &result.fingerprints.ja4);
         guard.ja4one.record(at_unix, &result.fingerprints.ja4one);

@@ -15,7 +15,9 @@ fn snapshot_counts_windowed_events_and_active_connections() {
     registry.record_connection_opened(90);
     registry.record_connection_opened(120);
     registry.record_upstream_error(125);
-    registry.record_request(130, &missing_result(SystemTime::UNIX_EPOCH));
+    let result = missing_result(SystemTime::UNIX_EPOCH);
+    registry.record_request_processed(130);
+    registry.record_fingerprint_computation(130, &result);
     registry.record_connection_closed();
 
     let snapshot = registry.snapshot(&EffectiveTimeWindow {
@@ -40,9 +42,10 @@ fn hot_counters_are_aggregated_by_second() {
 
     registry.record_connection_opened(200);
     registry.record_connection_opened(200);
-    registry.record_request(200, &result);
-    registry.record_request(200, &result);
-    registry.record_request(200, &result);
+    for _ in 0..3 {
+        registry.record_request_processed(200);
+        registry.record_fingerprint_computation(200, &result);
+    }
     registry.record_upstream_error(200);
 
     let snapshot = registry.snapshot(&EffectiveTimeWindow {
@@ -64,8 +67,10 @@ fn snapshot_is_stable_for_out_of_order_event_timestamps() {
     let registry = RuntimeStatsRegistry::new();
     let result = missing_result(SystemTime::UNIX_EPOCH);
 
-    registry.record_request(300, &result);
-    registry.record_request(100, &result);
+    registry.record_request_processed(300);
+    registry.record_fingerprint_computation(300, &result);
+    registry.record_request_processed(100);
+    registry.record_fingerprint_computation(100, &result);
 
     let snapshot = registry.snapshot(&EffectiveTimeWindow {
         from: 50,
@@ -82,7 +87,7 @@ fn snapshot_is_stable_for_out_of_order_event_timestamps() {
 fn fingerprint_failure_categories_map_to_expected_counters() {
     let registry = RuntimeStatsRegistry::new();
 
-    registry.record_request(400, &mixed_failure_result(SystemTime::UNIX_EPOCH));
+    registry.record_fingerprint_computation(400, &mixed_failure_result(SystemTime::UNIX_EPOCH));
 
     let snapshot = registry.snapshot(&EffectiveTimeWindow {
         from: 400,
@@ -107,7 +112,7 @@ fn fingerprint_failure_categories_map_to_expected_counters() {
 fn ja4t_availability_statistics_track_complete_partial_and_unavailable() {
     let registry = RuntimeStatsRegistry::new();
 
-    registry.record_request(
+    registry.record_fingerprint_computation(
         500,
         &result_with_ja4t_state(
             SystemTime::UNIX_EPOCH,
@@ -115,7 +120,7 @@ fn ja4t_availability_statistics_track_complete_partial_and_unavailable() {
             None,
         ),
     );
-    registry.record_request(
+    registry.record_fingerprint_computation(
         501,
         &result_with_ja4t_state(
             SystemTime::UNIX_EPOCH,
@@ -123,7 +128,7 @@ fn ja4t_availability_statistics_track_complete_partial_and_unavailable() {
             Some(FingerprintFailureReason::Timeout),
         ),
     );
-    registry.record_request(
+    registry.record_fingerprint_computation(
         502,
         &result_with_ja4t_state(
             SystemTime::UNIX_EPOCH,
@@ -151,7 +156,7 @@ fn ja4t_availability_statistics_track_complete_partial_and_unavailable() {
 #[test]
 fn snapshot_exposes_data_availability_counters() {
     let registry = RuntimeStatsRegistry::new();
-    registry.record_request(600, &missing_result(SystemTime::UNIX_EPOCH));
+    registry.record_fingerprint_computation(600, &missing_result(SystemTime::UNIX_EPOCH));
 
     let snapshot = registry.snapshot(&EffectiveTimeWindow {
         from: 600,

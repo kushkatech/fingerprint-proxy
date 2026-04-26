@@ -24,6 +24,11 @@ server_names = [
 kind = "use_default"
 id = "default"
 
+[dynamic_provider]
+kind = "file"
+polling_interval_seconds = 5
+upstream_connectivity_validation_mode = "disabled"
+
 [stats_api]
 enabled = true
 bind = "127.0.0.1:9100"

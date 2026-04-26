@@ -5,6 +5,7 @@ use fingerprint_proxy_core::request::HttpResponse;
 
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
+const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: usize = 16_384;
 
 pub fn encode_http2_response_frames(
     encoder: &mut fingerprint_proxy_hpack::Encoder,
@@ -39,16 +40,27 @@ pub fn encode_http2_response_frames(
     });
 
     if has_body {
-        let payload = resp.body.clone();
-        frames.push(Frame {
-            header: FrameHeader {
-                length: payload.len() as u32,
-                frame_type: FrameType::Data,
-                flags: if has_trailers { 0 } else { FLAG_END_STREAM },
-                stream_id,
-            },
-            payload: FramePayload::Data(payload),
-        });
+        for (index, chunk) in resp
+            .body
+            .chunks(DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+            .enumerate()
+        {
+            let is_final_chunk = (index + 1) * DEFAULT_MAX_FRAME_PAYLOAD_BYTES >= resp.body.len();
+            let payload = chunk.to_vec();
+            frames.push(Frame {
+                header: FrameHeader {
+                    length: payload.len() as u32,
+                    frame_type: FrameType::Data,
+                    flags: if is_final_chunk && !has_trailers {
+                        FLAG_END_STREAM
+                    } else {
+                        0
+                    },
+                    stream_id,
+                },
+                payload: FramePayload::Data(payload),
+            });
+        }
     }
 
     if has_trailers {

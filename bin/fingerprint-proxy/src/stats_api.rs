@@ -35,6 +35,7 @@ pub async fn serve_stats_api(
     cfg: StatsApiConfig,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
     runtime_stats: Arc<RuntimeStatsRegistry>,
+    operational_state: crate::health::SharedRuntimeOperationalState,
     shutdown: watch::Receiver<bool>,
     graceful_timeout: std::time::Duration,
 ) -> FpResult<()> {
@@ -46,6 +47,7 @@ pub async fn serve_stats_api(
         cfg,
         dynamic_config_state,
         runtime_stats,
+        operational_state,
         shutdown,
         graceful_timeout,
     )
@@ -57,6 +59,7 @@ async fn serve_stats_api_with_listener(
     cfg: StatsApiConfig,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
     runtime_stats: Arc<RuntimeStatsRegistry>,
+    operational_state: crate::health::SharedRuntimeOperationalState,
     mut shutdown: watch::Receiver<bool>,
     graceful_timeout: std::time::Duration,
 ) -> FpResult<()> {
@@ -83,6 +86,7 @@ async fn serve_stats_api_with_listener(
                 let cfg = Arc::clone(&cfg);
                 let dynamic_config_state = dynamic_config_state.clone();
                 let runtime_stats = Arc::clone(&runtime_stats);
+                let operational_state = operational_state.clone();
                 connections.spawn(async move {
                     handle_stats_connection(
                         tcp,
@@ -90,6 +94,7 @@ async fn serve_stats_api_with_listener(
                         cfg,
                         dynamic_config_state,
                         runtime_stats,
+                        operational_state,
                     )
                     .await
                 });
@@ -125,6 +130,7 @@ async fn handle_stats_connection(
     cfg: Arc<StatsApiConfig>,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
     runtime_stats: Arc<RuntimeStatsRegistry>,
+    operational_state: crate::health::SharedRuntimeOperationalState,
 ) -> FpResult<()> {
     let mut stream = tcp;
     let mut buf = Vec::new();
@@ -181,8 +187,12 @@ async fn handle_stats_connection(
     } else {
         match validate_stats_api_endpoint(&req.method, &req.uri) {
             Ok(endpoint) => {
-                match build_stats_success_payload(&endpoint, &dynamic_config_state, &runtime_stats)
-                {
+                match build_stats_success_payload(
+                    &endpoint,
+                    &dynamic_config_state,
+                    &runtime_stats,
+                    &operational_state,
+                ) {
                     Ok(payload) => {
                         body = payload;
                         200
@@ -292,6 +302,7 @@ fn build_stats_success_payload(
     endpoint: &StatsApiEndpoint,
     dynamic_config_state: &crate::dynamic_config::SharedDynamicConfigState,
     runtime_stats: &RuntimeStatsRegistry,
+    operational_state: &crate::health::SharedRuntimeOperationalState,
 ) -> FpResult<Vec<u8>> {
     let generated_at_unix = unix_now();
 
@@ -313,7 +324,7 @@ fn build_stats_success_payload(
                 .map_err(|e| FpError::internal(format!("stats payload serialize failed: {e}")))?
         }
         StatsApiEndpoint::Health => {
-            let payload = build_health_payload(generated_at_unix);
+            let payload = build_health_payload(generated_at_unix, operational_state.stats_status());
             apply_data_restrictions(&payload)
                 .map_err(|e| FpError::internal(format!("stats payload serialize failed: {e}")))?
         }
@@ -360,6 +371,17 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     async fn start_server(cfg: StatsApiConfig) -> (SocketAddr, watch::Sender<bool>) {
+        start_server_with_operational_state(
+            cfg,
+            crate::health::SharedRuntimeOperationalState::new(),
+        )
+        .await
+    }
+
+    async fn start_server_with_operational_state(
+        cfg: StatsApiConfig,
+        operational_state: crate::health::SharedRuntimeOperationalState,
+    ) -> (SocketAddr, watch::Sender<bool>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, rx) = watch::channel(false);
@@ -374,6 +396,7 @@ mod tests {
                 StatsApiConfig { bind: addr, ..cfg },
                 dynamic_config_state,
                 runtime_stats,
+                operational_state,
                 rx,
                 std::time::Duration::from_millis(200),
             )
@@ -485,6 +508,44 @@ mod tests {
         }
 
         shutdown.send(true).expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn stats_health_reports_healthy_operational_state() {
+        let (addr, shutdown) = start_server(cfg_enabled_with_allow_and_token(true)).await;
+        let resp = send_request(
+            addr,
+            b"GET /stats/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\n\r\n",
+        )
+        .await;
+        shutdown.send(true).expect("shutdown");
+
+        assert!(resp.starts_with(b"HTTP/1.1 200\r\n"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(response_body(&resp)).expect("json body");
+        assert_eq!(parsed["status"], serde_json::json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn stats_health_reports_degraded_operational_state() {
+        let operational_state = crate::health::SharedRuntimeOperationalState::new();
+        operational_state.mark_supervision_failed();
+        let (addr, shutdown) = start_server_with_operational_state(
+            cfg_enabled_with_allow_and_token(true),
+            operational_state,
+        )
+        .await;
+        let resp = send_request(
+            addr,
+            b"GET /stats/health HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret\r\n\r\n",
+        )
+        .await;
+        shutdown.send(true).expect("shutdown");
+
+        assert!(resp.starts_with(b"HTTP/1.1 200\r\n"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(response_body(&resp)).expect("json body");
+        assert_eq!(parsed["status"], serde_json::json!("degraded"));
     }
 
     #[tokio::test]
@@ -606,6 +667,7 @@ mod tests {
             cfg,
             crate::dynamic_config::SharedDynamicConfigState::new(),
             Arc::new(RuntimeStatsRegistry::new()),
+            crate::health::SharedRuntimeOperationalState::new(),
             watch::channel(false).1,
             std::time::Duration::from_millis(1),
         )

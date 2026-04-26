@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::EnvFilter;
 
 pub mod filtering;
@@ -16,4 +17,19 @@ pub fn init_logging() {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         tracing_subscriber::fmt().with_env_filter(filter).init();
     });
+}
+
+pub fn current_timestamp_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+pub fn format_structured_log_event(event: &StructuredLogEvent) -> String {
+    event.clone().filtered().to_log_line()
+}
+
+pub fn emit_structured_log_event(event: StructuredLogEvent) {
+    eprintln!("{}", format_structured_log_event(&event));
 }

@@ -4,6 +4,12 @@ use fingerprint_proxy_http1_orchestrator::{
     AssemblerInput, Http1ConnectionRouter, Http1ProcessOutput, Http1RouterDeps,
     PendingWebSocketUpgrade,
 };
+use fingerprint_proxy_http2::{
+    ConnectionEvent as Http2ConnectionEvent, ConnectionPreface as Http2ConnectionPreface,
+    Frame as Http2Frame, FrameHeader as Http2FrameHeader, FramePayload as Http2FramePayload,
+    FrameType as Http2FrameType, Http2Connection, Settings as Http2Settings,
+    StreamId as Http2StreamId,
+};
 use fingerprint_proxy_http2_orchestrator::{Http2ConnectionRouter, RouterDeps as Http2RouterDeps};
 use fingerprint_proxy_http3::Frame as Http3Frame;
 use fingerprint_proxy_http3_orchestrator::{Http3ConnectionRouter, RouterDeps as Http3RouterDeps};
@@ -37,6 +43,8 @@ pub trait DispatcherDeps: Send {
 pub struct TlsEntryDispatcher {
     http1: Http1ConnectionRouter,
     http2: Http2ConnectionRouter,
+    http2_connection: Http2Connection,
+    http2_remote_settings_received: bool,
     http3: Http3ConnectionRouter,
     http2_parser: Http2ProtocolParser,
 }
@@ -88,9 +96,60 @@ impl TlsEntryDispatcher {
             return Err(FpError::invalid_protocol_data(ERROR_ALPN_INPUT_MISMATCH));
         };
 
+        let preface_consumed_before = self.http2_parser.preface_consumed();
         let parsed_frames = self.http2_parser.push_bytes(bytes)?;
         let mut out_frames = Vec::new();
+
+        if !preface_consumed_before && self.http2_parser.preface_consumed() {
+            self.http2_connection
+                .accept_client_preface(Http2ConnectionPreface::CLIENT_BYTES)
+                .map_err(|err| FpError::invalid_protocol_data(err.to_string()))?;
+            self.http2_connection
+                .queue_local_settings()
+                .map_err(|err| FpError::invalid_protocol_data(err.to_string()))?;
+            out_frames.push(settings_frame(false));
+        }
+
         for frame in parsed_frames {
+            if !self.http2_remote_settings_received {
+                match &frame.payload {
+                    Http2FramePayload::Settings { ack: false, .. }
+                        if frame.header.stream_id.is_connection() =>
+                    {
+                        self.http2_remote_settings_received = true;
+                    }
+                    _ => {
+                        return Err(FpError::invalid_protocol_data(
+                            "HTTP/2 client preface must be followed by a SETTINGS frame",
+                        ));
+                    }
+                }
+            }
+
+            let event = self
+                .http2_connection
+                .receive_frame(&frame)
+                .map_err(|err| FpError::invalid_protocol_data(err.to_string()))?;
+            match event {
+                Http2ConnectionEvent::AckSettings => out_frames.push(settings_frame(true)),
+                Http2ConnectionEvent::PingAck { opaque } => out_frames.push(ping_ack_frame(opaque)),
+                Http2ConnectionEvent::ReplenishInboundWindow {
+                    stream_id,
+                    connection_increment,
+                    stream_increment,
+                } => {
+                    out_frames.push(window_update_frame(
+                        Http2StreamId::connection(),
+                        connection_increment,
+                    ));
+                    out_frames.push(window_update_frame(stream_id, stream_increment));
+                }
+                Http2ConnectionEvent::None | Http2ConnectionEvent::GoAwayReceived { .. } => {}
+            }
+            if !routes_to_http2_request_assembler(&frame) {
+                continue;
+            }
+
             let frames = self.http2.process_frame(frame, deps.http2()).await?;
             out_frames.extend(frames);
         }
@@ -114,4 +173,52 @@ impl TlsEntryDispatcher {
         };
         Ok(DispatcherOutput::Http3Frames(out))
     }
+}
+
+fn settings_frame(ack: bool) -> Http2Frame {
+    Http2Frame {
+        header: Http2FrameHeader {
+            length: 0,
+            frame_type: Http2FrameType::Settings,
+            flags: if ack { 0x1 } else { 0x0 },
+            stream_id: Http2StreamId::connection(),
+        },
+        payload: Http2FramePayload::Settings {
+            ack,
+            settings: Http2Settings::new(Vec::new()),
+        },
+    }
+}
+
+fn ping_ack_frame(opaque: [u8; 8]) -> Http2Frame {
+    Http2Frame {
+        header: Http2FrameHeader {
+            length: 8,
+            frame_type: Http2FrameType::Ping,
+            flags: 0x1,
+            stream_id: Http2StreamId::connection(),
+        },
+        payload: Http2FramePayload::Ping { ack: true, opaque },
+    }
+}
+
+fn window_update_frame(stream_id: Http2StreamId, window_size_increment: u32) -> Http2Frame {
+    Http2Frame {
+        header: Http2FrameHeader {
+            length: 4,
+            frame_type: Http2FrameType::WindowUpdate,
+            flags: 0,
+            stream_id,
+        },
+        payload: Http2FramePayload::WindowUpdate {
+            window_size_increment,
+        },
+    }
+}
+
+fn routes_to_http2_request_assembler(frame: &Http2Frame) -> bool {
+    matches!(
+        frame.header.frame_type,
+        Http2FrameType::Data | Http2FrameType::Headers | Http2FrameType::Continuation
+    )
 }

@@ -1,7 +1,20 @@
+use fingerprint_proxy_bootstrap_config::config::DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS;
+use fingerprint_proxy_bootstrap_config::dynamic::upstream_check::UpstreamConnectivityValidationMode;
 use fingerprint_proxy_bootstrap_config::file_provider::{
     detect_config_format, load_bootstrap_config_from_file, ConfigFormat,
 };
 use fingerprint_proxy_core::error::ErrorKind;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn write_temp_config(contents: &str) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("fingerprint-proxy-config-format-{id}"));
+    std::fs::create_dir_all(&dir).expect("create temp config dir");
+    let path = dir.join("bootstrap.toml");
+    std::fs::write(&path, contents).expect("write temp config");
+    path
+}
 
 #[test]
 fn detect_config_format_by_extension() {
@@ -60,4 +73,129 @@ fn load_bootstrap_config_unknown_extension_is_invalid_configuration() {
         err.message,
         "unknown config format: expected .toml, .json, .yaml, or .yml"
     );
+}
+
+#[test]
+fn dynamic_provider_upstream_validation_mode_defaults_disabled() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    let provider = cfg.dynamic_provider.expect("dynamic provider");
+    assert_eq!(
+        provider.polling_interval_seconds,
+        DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS
+    );
+    assert_eq!(
+        provider.upstream_connectivity_validation_mode,
+        UpstreamConnectivityValidationMode::Disabled
+    );
+}
+
+#[test]
+fn dynamic_provider_polling_interval_parses_custom_seconds() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+polling_interval_seconds = 17
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    let provider = cfg.dynamic_provider.expect("dynamic provider");
+    assert_eq!(provider.polling_interval_seconds, 17);
+}
+
+#[test]
+fn dynamic_provider_polling_interval_rejects_zero() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+polling_interval_seconds = 0
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("zero interval");
+
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("bootstrap.dynamic_provider.polling_interval_seconds"));
+    assert!(err
+        .message
+        .contains("dynamic polling interval must be greater than zero"));
+}
+
+#[test]
+fn dynamic_provider_polling_interval_rejects_non_integer_shape() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+polling_interval_seconds = 1.5
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("non-integer interval");
+
+    assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+    assert!(err.message.contains("polling_interval_seconds"));
+}
+
+#[test]
+fn dynamic_provider_upstream_validation_mode_parses_strict() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+upstream_connectivity_validation_mode = "strict"
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    let provider = cfg.dynamic_provider.expect("dynamic provider");
+    assert_eq!(
+        provider.upstream_connectivity_validation_mode,
+        UpstreamConnectivityValidationMode::Strict
+    );
+}
+
+#[test]
+fn dynamic_provider_upstream_validation_mode_rejects_invalid_values() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[dynamic_provider]
+kind = "file"
+upstream_connectivity_validation_mode = "permissive"
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("invalid mode");
+
+    assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+    assert!(err
+        .message
+        .contains("upstream_connectivity_validation_mode"));
+    assert!(err.message.contains("permissive"));
 }

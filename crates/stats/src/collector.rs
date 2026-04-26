@@ -8,7 +8,8 @@ use std::sync::Arc;
 pub trait StatsCollector: Send + Sync {
     fn record_connection_opened(&self, at_unix: u64);
     fn record_connection_closed(&self);
-    fn record_request(&self, at_unix: u64, result: &FingerprintComputationResult);
+    fn record_request_processed(&self, at_unix: u64);
+    fn record_fingerprint_computation(&self, at_unix: u64, result: &FingerprintComputationResult);
     fn record_upstream_error(&self, at_unix: u64);
     fn record_pooling_event(&self, at_unix: u64, event: PoolingEvent);
     fn record_configuration_update(&self, at_unix: u64);
@@ -35,8 +36,16 @@ impl RuntimeStatsRegistry {
         self.storage.record_connection_closed();
     }
 
-    pub fn record_request(&self, at_unix: u64, result: &FingerprintComputationResult) {
-        self.storage.record_request(at_unix, result);
+    pub fn record_request_processed(&self, at_unix: u64) {
+        self.storage.record_request_processed(at_unix);
+    }
+
+    pub fn record_fingerprint_computation(
+        &self,
+        at_unix: u64,
+        result: &FingerprintComputationResult,
+    ) {
+        self.storage.record_fingerprint_computation(at_unix, result);
     }
 
     pub fn record_upstream_error(&self, at_unix: u64) {
@@ -73,8 +82,12 @@ impl StatsCollector for RuntimeStatsRegistry {
         self.storage.record_connection_closed();
     }
 
-    fn record_request(&self, at_unix: u64, result: &FingerprintComputationResult) {
-        self.storage.record_request(at_unix, result);
+    fn record_request_processed(&self, at_unix: u64) {
+        self.storage.record_request_processed(at_unix);
+    }
+
+    fn record_fingerprint_computation(&self, at_unix: u64, result: &FingerprintComputationResult) {
+        self.storage.record_fingerprint_computation(at_unix, result);
     }
 
     fn record_upstream_error(&self, at_unix: u64) {

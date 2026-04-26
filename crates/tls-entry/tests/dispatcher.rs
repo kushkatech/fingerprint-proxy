@@ -28,6 +28,10 @@ use fingerprint_proxy_tls_entry::{
 };
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::SystemTime;
 
 fn make_connection() -> ConnectionContext {
@@ -134,6 +138,7 @@ struct TestHttp2Deps<'a> {
     pipeline: &'a Pipeline,
     decoder: Decoder,
     encoder: Encoder,
+    requests_built: Arc<AtomicUsize>,
 }
 
 impl fingerprint_proxy_http2_orchestrator::RouterDeps for TestHttp2Deps<'_> {
@@ -150,6 +155,7 @@ impl fingerprint_proxy_http2_orchestrator::RouterDeps for TestHttp2Deps<'_> {
     }
 
     fn build_prepipeline_input(&self, request: HttpRequest) -> FpResult<PrePipelineInput> {
+        self.requests_built.fetch_add(1, Ordering::SeqCst);
         Ok(PrePipelineInput {
             id: RequestId(1),
             connection: make_connection(),
@@ -300,6 +306,23 @@ fn h2_headers_only_request_bytes(stream_id: StreamId) -> Vec<u8> {
     serialize_frame(&frame).expect("serialize")
 }
 
+fn h2_headers_open_request_bytes(stream_id: StreamId) -> Vec<u8> {
+    let block = vec![
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c,
+        0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    ];
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: block.len() as u32,
+            frame_type: FrameType::Headers,
+            flags: 0x4, // END_HEADERS
+            stream_id,
+        },
+        payload: FramePayload::Headers(block),
+    };
+    serialize_frame(&frame).expect("serialize")
+}
+
 fn h2_preface_and_frames_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(ConnectionPreface::CLIENT_BYTES);
@@ -307,6 +330,78 @@ fn h2_preface_and_frames_bytes(frames: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(f);
     }
     out
+}
+
+fn h2_settings_frame_bytes(ack: bool) -> Vec<u8> {
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: 0,
+            frame_type: FrameType::Settings,
+            flags: if ack { 0x1 } else { 0x0 },
+            stream_id: StreamId::connection(),
+        },
+        payload: FramePayload::Settings {
+            ack,
+            settings: fingerprint_proxy_http2::Settings::new(Vec::new()),
+        },
+    };
+    serialize_frame(&frame).expect("serialize SETTINGS")
+}
+
+fn h2_ping_frame_bytes(ack: bool, opaque: [u8; 8]) -> Vec<u8> {
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: 8,
+            frame_type: FrameType::Ping,
+            flags: if ack { 0x1 } else { 0x0 },
+            stream_id: StreamId::connection(),
+        },
+        payload: FramePayload::Ping { ack, opaque },
+    };
+    serialize_frame(&frame).expect("serialize PING")
+}
+
+fn h2_goaway_frame_bytes(last_stream_id: StreamId) -> Vec<u8> {
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: 8,
+            frame_type: FrameType::GoAway,
+            flags: 0,
+            stream_id: StreamId::connection(),
+        },
+        payload: FramePayload::GoAway {
+            last_stream_id,
+            error_code: 0,
+            debug_data: Vec::new(),
+        },
+    };
+    serialize_frame(&frame).expect("serialize GOAWAY")
+}
+
+fn h2_rst_stream_frame_bytes(stream_id: StreamId) -> Vec<u8> {
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: 4,
+            frame_type: FrameType::RstStream,
+            flags: 0,
+            stream_id,
+        },
+        payload: FramePayload::RstStream { error_code: 0 },
+    };
+    serialize_frame(&frame).expect("serialize RST_STREAM")
+}
+
+fn h2_data_frame_bytes(stream_id: StreamId, flags: u8, payload: Vec<u8>) -> Vec<u8> {
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: payload.len() as u32,
+            frame_type: FrameType::Data,
+            flags,
+            stream_id,
+        },
+        payload: FramePayload::Data(payload),
+    };
+    serialize_frame(&frame).expect("serialize DATA")
 }
 
 fn make_test_deps(pipeline: &Pipeline) -> TestDeps<'_> {
@@ -321,6 +416,7 @@ fn make_test_deps(pipeline: &Pipeline) -> TestDeps<'_> {
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps { pipeline },
     }
@@ -371,6 +467,7 @@ async fn alpn_h1_routes_to_http1_orchestrator() {
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps {
             pipeline: &pipeline,
@@ -423,14 +520,17 @@ async fn alpn_h2_routes_to_http2_orchestrator() {
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps {
             pipeline: &pipeline,
         },
     };
 
-    let bytes =
-        h2_preface_and_frames_bytes(&[h2_headers_only_request_bytes(StreamId::new(1).unwrap())]);
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_only_request_bytes(StreamId::new(1).unwrap()),
+    ]);
     let mut dispatcher = TlsEntryDispatcher::new();
     let out = dispatcher
         .dispatch(
@@ -476,6 +576,734 @@ async fn alpn_h2_routes_to_http2_orchestrator() {
 }
 
 #[tokio::test]
+async fn http2_preface_and_client_settings_emit_server_settings_and_ack() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false)]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("dispatch");
+
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].header.frame_type, FrameType::Settings);
+    assert_eq!(frames[0].header.flags, 0);
+    assert_eq!(frames[0].header.stream_id, StreamId::connection());
+    assert_eq!(frames[1].header.frame_type, FrameType::Settings);
+    assert_eq!(frames[1].header.flags, 0x1);
+    assert_eq!(frames[1].header.stream_id, StreamId::connection());
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_client_settings_ack_is_consumed_without_stream_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false)]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("initial settings");
+
+    let ack = h2_settings_frame_bytes(true);
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&ack),
+            &mut deps,
+        )
+        .await
+        .expect("settings ack");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    assert!(frames.is_empty());
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_ping_emits_ack_with_same_opaque_payload() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let opaque = *b"pingpong";
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_ping_frame_bytes(false, opaque),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("dispatch");
+
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    let ping_ack = frames
+        .iter()
+        .find(|f| f.header.frame_type == FrameType::Ping)
+        .expect("PING ACK");
+    assert_eq!(ping_ack.header.flags, 0x1);
+    assert_eq!(ping_ack.header.stream_id, StreamId::connection());
+    assert_eq!(ping_ack.payload, FramePayload::Ping { ack: true, opaque });
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_ping_ack_is_consumed_without_stream_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false)]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("initial settings");
+
+    let ack = h2_ping_frame_bytes(true, *b"ack-ack!");
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&ack),
+            &mut deps,
+        )
+        .await
+        .expect("ping ack");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    assert!(frames.is_empty());
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_data_emits_connection_and_stream_window_updates() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let mut deps = make_test_deps(&pipeline);
+    let stream_id = StreamId::new(1).unwrap();
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_open_request_bytes(stream_id),
+        h2_data_frame_bytes(stream_id, 0, vec![0; 1_024]),
+    ]);
+
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("dispatch");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+
+    let updates: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.frame_type == FrameType::WindowUpdate)
+        .collect();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].header.stream_id, StreamId::connection());
+    assert_eq!(
+        updates[0].payload,
+        FramePayload::WindowUpdate {
+            window_size_increment: 1_024,
+        }
+    );
+    assert_eq!(updates[1].header.stream_id, stream_id);
+    assert_eq!(
+        updates[1].payload,
+        FramePayload::WindowUpdate {
+            window_size_increment: 1_024,
+        }
+    );
+}
+
+#[tokio::test]
+async fn http2_chunked_body_larger_than_initial_window_completes_with_window_updates() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+    let stream_id = StreamId::new(1).unwrap();
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_open_request_bytes(stream_id),
+        h2_data_frame_bytes(stream_id, 0, vec![b'a'; 32_768]),
+        h2_data_frame_bytes(stream_id, 0, vec![b'b'; 32_768]),
+        h2_data_frame_bytes(stream_id, 0x1, vec![b'c'; 1]),
+    ]);
+
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("large chunked body completes");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+
+    let updates: Vec<_> = frames
+        .iter()
+        .filter(|f| f.header.frame_type == FrameType::WindowUpdate)
+        .collect();
+    assert_eq!(updates.len(), 6);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert!(frames
+        .iter()
+        .any(|f| f.header.frame_type == FrameType::Headers && f.header.stream_id == stream_id));
+}
+
+#[tokio::test]
+async fn http2_goaway_prevents_new_request_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_goaway_frame_bytes(StreamId::new(1).unwrap()),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("goaway");
+
+    let request = h2_headers_only_request_bytes(StreamId::new(3).unwrap());
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&request),
+            &mut deps,
+        )
+        .await
+        .expect_err("new request after GOAWAY must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert!(err.message.contains("NewStreamAfterGoAway"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_even_client_stream_id_is_rejected_before_request_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_only_request_bytes(StreamId::new(2).unwrap()),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect_err("even client stream id must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert!(err.message.contains("InvalidClientInitiatedStreamId"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_lower_new_client_stream_id_is_rejected_before_request_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_only_request_bytes(StreamId::new(5).unwrap()),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("stream 5 routes");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let lower = h2_headers_only_request_bytes(StreamId::new(3).unwrap());
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&lower),
+            &mut deps,
+        )
+        .await
+        .expect_err("lower new stream id must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert!(err.message.contains("NonIncreasingClientStreamId"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http2_headers_after_end_stream_are_rejected_before_request_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let stream_id = StreamId::new(1).unwrap();
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_only_request_bytes(stream_id),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("first request routes");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let reused = h2_headers_only_request_bytes(stream_id);
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&reused),
+            &mut deps,
+        )
+        .await
+        .expect_err("reused stream after END_STREAM must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert!(err.message.contains("StreamAlreadyClosed"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http2_valid_increasing_odd_client_stream_ids_still_route() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_only_request_bytes(StreamId::new(1).unwrap()),
+        h2_headers_only_request_bytes(StreamId::new(3).unwrap()),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("valid increasing odd streams route");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    let response_headers_streams: Vec<u32> = frames
+        .iter()
+        .filter(|f| f.header.frame_type == FrameType::Headers)
+        .map(|f| f.header.stream_id.as_u32())
+        .collect();
+    assert!(response_headers_streams.contains(&1));
+    assert!(response_headers_streams.contains(&3));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn http2_rst_stream_is_consumed_without_request_routing() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let stream_id = StreamId::new(1).unwrap();
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_headers_open_request_bytes(stream_id),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("open stream");
+
+    let rst = h2_rst_stream_frame_bytes(stream_id);
+    let out = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&rst),
+            &mut deps,
+        )
+        .await
+        .expect("rst stream");
+    let DispatcherOutput::Http2Frames(frames) = out else {
+        panic!("expected Http2Frames");
+    };
+    assert!(frames.is_empty());
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_unexpected_second_settings_ack_is_invalid_protocol_data() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+
+    let mut deps = make_test_deps(&pipeline);
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false)]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect("initial settings");
+
+    let ack = h2_settings_frame_bytes(true);
+    dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&ack),
+            &mut deps,
+        )
+        .await
+        .expect("local settings ack");
+
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&ack),
+            &mut deps,
+        )
+        .await
+        .expect_err("second ack must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert!(err.message.contains("UnexpectedSettingsAck"));
+}
+
+#[tokio::test]
+async fn http2_rejects_stream_frame_before_client_settings() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+
+    let mut deps = make_test_deps(&pipeline);
+    let bytes =
+        h2_preface_and_frames_bytes(&[h2_headers_only_request_bytes(StreamId::new(1).unwrap())]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect_err("stream frame before client SETTINGS must fail");
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert_eq!(
+        err.message,
+        "HTTP/2 client preface must be followed by a SETTINGS frame"
+    );
+}
+
+#[tokio::test]
 async fn http2_bytes_split_across_calls_is_buffered_until_complete_frame() {
     let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
         status: 204,
@@ -485,7 +1313,7 @@ async fn http2_bytes_split_across_calls_is_buffered_until_complete_frame() {
 
     let mut deps = make_test_deps(&pipeline);
     let frame_bytes = h2_headers_only_request_bytes(StreamId::new(1).unwrap());
-    let bytes = h2_preface_and_frames_bytes(&[frame_bytes]);
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false), frame_bytes]);
 
     let split1 = 5usize.min(bytes.len());
     let (first, rest) = bytes.split_at(split1);
@@ -545,6 +1373,7 @@ async fn http2_bytes_multiple_frames_in_one_buffer_are_all_processed() {
     let mut dispatcher = TlsEntryDispatcher::new();
 
     let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
         h2_headers_only_request_bytes(StreamId::new(1).unwrap()),
         h2_headers_only_request_bytes(StreamId::new(3).unwrap()),
     ]);
@@ -582,7 +1411,7 @@ async fn http2_bytes_leftover_partial_header_is_preserved_for_next_call() {
 
     let mut deps = make_test_deps(&pipeline);
     let frame_bytes = h2_headers_only_request_bytes(StreamId::new(1).unwrap());
-    let bytes = h2_preface_and_frames_bytes(&[frame_bytes]);
+    let bytes = h2_preface_and_frames_bytes(&[h2_settings_frame_bytes(false), frame_bytes]);
 
     let split = (ConnectionPreface::CLIENT_BYTES.len() + 2).min(bytes.len());
     let (first, second) = bytes.split_at(split);
@@ -599,7 +1428,9 @@ async fn http2_bytes_leftover_partial_header_is_preserved_for_next_call() {
     let DispatcherOutput::Http2Frames(frames1) = out1 else {
         panic!("expected Http2Frames");
     };
-    assert!(frames1.is_empty());
+    assert_eq!(frames1.len(), 1);
+    assert_eq!(frames1[0].header.frame_type, FrameType::Settings);
+    assert_eq!(frames1[0].header.flags, 0);
 
     let out2 = dispatcher
         .dispatch(
@@ -662,6 +1493,7 @@ async fn alpn_h3_routes_to_http3_orchestrator_and_finish_stream_emits_response()
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps {
             pipeline: &pipeline,
@@ -726,6 +1558,7 @@ async fn missing_or_unsupported_alpn_is_invalid_protocol_data() {
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps {
             pipeline: &pipeline,
@@ -780,6 +1613,7 @@ async fn alpn_input_mismatch_is_invalid_protocol_data() {
                 max_dynamic_table_size: 4096,
                 use_huffman: false,
             }),
+            requests_built: Arc::new(AtomicUsize::new(0)),
         },
         http3: TestHttp3Deps {
             pipeline: &pipeline,

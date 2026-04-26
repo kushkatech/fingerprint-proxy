@@ -12,7 +12,16 @@ impl FingerprintingStatsIntegration {
         Self { stats_registry }
     }
 
-    pub fn record_request_fingerprints(&self, at_unix: u64, result: &FingerprintComputationResult) {
-        self.stats_registry.record_request(at_unix, result);
+    pub fn record_request_processed(&self, at_unix: u64) {
+        self.stats_registry.record_request_processed(at_unix);
+    }
+
+    pub fn record_fingerprint_computation(
+        &self,
+        at_unix: u64,
+        result: &FingerprintComputationResult,
+    ) {
+        self.stats_registry
+            .record_fingerprint_computation(at_unix, result);
     }
 }

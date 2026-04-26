@@ -1,5 +1,6 @@
 use fingerprint_proxy_core::logging::{
-    filter_sensitive_context, parse_log_level, redact_value, LogLevel, StructuredLogEvent,
+    filter_sensitive_context, format_structured_log_event, parse_log_level, redact_value, LogLevel,
+    StructuredLogEvent,
 };
 use std::collections::BTreeMap;
 
@@ -13,6 +14,18 @@ fn structured_log_event_representation_is_stable() {
     assert_eq!(
         event.to_log_line(),
         "ts=1710001234567 level=INFO component=runtime message=request_done context={a=first,m=middle,z=last}"
+    );
+}
+
+#[test]
+fn structured_log_formatting_applies_sensitive_context_filtering() {
+    let event = StructuredLogEvent::new(1710001234567, LogLevel::Warn, "runtime", "auth_failure")
+        .with_context("authorization", "Bearer secret-token")
+        .with_context("path", "/health");
+
+    assert_eq!(
+        format_structured_log_event(&event),
+        "ts=1710001234567 level=WARN component=runtime message=auth_failure context={authorization=[REDACTED],path=/health}"
     );
 }
 

@@ -1,3 +1,4 @@
+use crate::dynamic::upstream_check::UpstreamConnectivityValidationMode;
 use fingerprint_proxy_core::identifiers::ConfigVersion;
 use fingerprint_proxy_core::upstream_protocol::UpstreamAppProtocol;
 use std::collections::BTreeMap;
@@ -94,9 +95,12 @@ pub struct TlsCertificateConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicConfigProviderSettings {
     pub kind: String,
+    pub polling_interval_seconds: u64,
+    pub upstream_connectivity_validation_mode: UpstreamConnectivityValidationMode,
 }
 
 pub const FILE_DYNAMIC_PROVIDER_KIND: &str = "file";
+pub const DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS: u64 = 5;
 
 impl DynamicConfigProviderSettings {
     pub fn is_supported_runtime_kind(&self) -> bool {

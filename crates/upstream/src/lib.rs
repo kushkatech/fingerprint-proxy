@@ -1,4 +1,5 @@
 pub mod http2;
+pub mod http2_session;
 pub mod ipv6;
 pub mod ipv6_routing;
 pub mod manager;

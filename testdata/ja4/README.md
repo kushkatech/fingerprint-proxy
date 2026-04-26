@@ -41,6 +41,14 @@ through project code, and match official snapshot output exactly. Rows marked
 and baseline diverge or if an artifact marked as missing JA4 output later gains
 official TCP/TLS `ja4` snapshot output.
 
+Unsupported artifact accounting is explicit in
+`testdata/ja4/unsupported-artifact-baseline.psv`. That baseline has one row per
+unsupported manifest artifact across snapshots, JSON expectations, and recovered
+raw captures. The harness derives unsupported reason counts from this file and
+fails on duplicate rows, blank or unknown reasons, unsupported artifacts missing
+from the baseline, baseline rows for artifacts that are now supported, and
+baseline rows that no longer exist in `corpus-manifest.psv`.
+
 Supported raw-capture exact-output cases:
 
 - 12 TCP/TLS raw captures under `testdata/ja4/pcap/` are parsed offline.
@@ -85,11 +93,11 @@ pass/fail fingerprint successes:
 The harness fails if supported raw capture outputs mismatch, imported
 comparable expected values mismatch, raw validations or imported expected-data
 comparisons are zero, manifest paths are missing, unsupported imported artifacts
-are not accounted, a supported parser path errors, or an unsupported reason is
-blank/unknown. Unsupported count failures include a deterministic
-reason-to-artifact map so bucket membership changes are reviewable by filename.
-The transitional `vectors.tsv` file has been removed because the imported raw
-corpus is now the primary JA4 correctness source.
+are not accounted by the explicit baseline, a supported parser path errors, or
+an unsupported reason is blank/unknown. Unsupported count failures include a
+deterministic reason-to-artifact map so bucket membership changes are reviewable
+by artifact path. The transitional `vectors.tsv` file has been removed because
+the imported raw corpus is now the primary JA4 correctness source.
 
 The separate `vendor/ja4/` directory is retained for upstream JA4 technical
 details and license/reference documentation. It is not the JA4 test corpus.

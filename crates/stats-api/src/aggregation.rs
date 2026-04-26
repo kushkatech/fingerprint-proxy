@@ -145,10 +145,10 @@ pub fn build_fingerprint_payload(
     }
 }
 
-pub fn build_health_payload(generated_at_unix: u64) -> HealthPayload {
+pub fn build_health_payload(generated_at_unix: u64, status: &'static str) -> HealthPayload {
     HealthPayload {
         generated_at_unix,
-        status: "ok",
+        status,
     }
 }
 

@@ -560,7 +560,7 @@ kind = "disabled"
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ValidationFailed"), "stderr was: {stderr}");
     assert!(
-        stderr.contains("bootstrap stats_api validation failed"),
+        stderr.contains("bootstrap config validation failed"),
         "stderr was: {stderr}"
     );
     assert!(

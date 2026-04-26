@@ -164,19 +164,164 @@ fn data_requires_known_stream_and_consumes_flow_control() {
         FramePayload::Data(vec![0; 1_024]),
         1_024,
     );
-    conn.receive_frame(&data).expect("consume data");
+    let event = conn.receive_frame(&data).expect("consume data");
+    assert_eq!(
+        event,
+        ConnectionEvent::ReplenishInboundWindow {
+            stream_id: sid(1),
+            connection_increment: 1_024,
+            stream_increment: 1_024,
+        }
+    );
     assert_eq!(
         conn.flow_control().connection_window(),
-        DEFAULT_WINDOW_SIZE as i64 - 1_024
+        DEFAULT_WINDOW_SIZE as i64
     );
     assert_eq!(
         conn.flow_control().stream_window(sid(1)),
-        Some(DEFAULT_WINDOW_SIZE as i64 - 1_024)
+        Some(DEFAULT_WINDOW_SIZE as i64)
     );
     assert_eq!(
         conn.stream_state(sid(1)),
         Some(StreamState::HalfClosedRemote)
     );
+}
+
+#[test]
+fn data_exceeding_current_window_still_fails_before_replenishment() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+    let open_stream = frame(
+        FrameType::Headers,
+        0,
+        sid(1),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    conn.receive_frame(&open_stream).expect("open stream");
+
+    let data = frame(
+        FrameType::Data,
+        0,
+        sid(1),
+        FramePayload::Data(vec![0; DEFAULT_WINDOW_SIZE as usize + 1]),
+        DEFAULT_WINDOW_SIZE + 1,
+    );
+    let err = conn.receive_frame(&data).expect_err("must fail");
+    assert_eq!(
+        err.kind,
+        ConnectionErrorKind::FlowControl(FlowControlError::InsufficientConnectionWindow {
+            available: DEFAULT_WINDOW_SIZE as i64,
+            requested: DEFAULT_WINDOW_SIZE + 1,
+        })
+    );
+}
+
+#[test]
+fn new_client_stream_headers_must_use_odd_increasing_ids() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let even_stream = frame(
+        FrameType::Headers,
+        0,
+        sid(2),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    let err = conn
+        .receive_frame(&even_stream)
+        .expect_err("even client stream id must fail");
+    assert_eq!(
+        err.kind,
+        ConnectionErrorKind::InvalidClientInitiatedStreamId(sid(2))
+    );
+
+    let stream_5 = frame(
+        FrameType::Headers,
+        0,
+        sid(5),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    conn.receive_frame(&stream_5).expect("open stream 5");
+    assert_eq!(conn.last_stream_id(), sid(5));
+
+    let lower_new_stream = frame(
+        FrameType::Headers,
+        0,
+        sid(3),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    let err = conn
+        .receive_frame(&lower_new_stream)
+        .expect_err("lower new stream id must fail");
+    assert_eq!(
+        err.kind,
+        ConnectionErrorKind::NonIncreasingClientStreamId {
+            stream_id: sid(3),
+            last_stream_id: sid(5),
+        }
+    );
+}
+
+#[test]
+fn headers_after_remote_end_stream_are_rejected() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let complete_stream = frame(
+        FrameType::Headers,
+        0x1,
+        sid(1),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    conn.receive_frame(&complete_stream)
+        .expect("complete request stream");
+    assert_eq!(
+        conn.stream_state(sid(1)),
+        Some(StreamState::HalfClosedRemote)
+    );
+
+    let reused_stream = frame(
+        FrameType::Headers,
+        0,
+        sid(1),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    let err = conn
+        .receive_frame(&reused_stream)
+        .expect_err("headers after END_STREAM must fail");
+    assert_eq!(err.kind, ConnectionErrorKind::StreamAlreadyClosed(sid(1)));
+}
+
+#[test]
+fn data_after_remote_end_stream_is_rejected() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let complete_stream = frame(
+        FrameType::Headers,
+        0x1,
+        sid(1),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    conn.receive_frame(&complete_stream)
+        .expect("complete request stream");
+
+    let data_after_end = frame(FrameType::Data, 0, sid(1), FramePayload::Data(vec![1]), 1);
+    let err = conn
+        .receive_frame(&data_after_end)
+        .expect_err("data after END_STREAM must fail");
+    assert_eq!(err.kind, ConnectionErrorKind::StreamAlreadyClosed(sid(1)));
 }
 
 #[test]
@@ -252,6 +397,71 @@ fn goaway_moves_connection_to_closing() {
         }
     );
     assert_eq!(conn.state(), ConnectionState::Closing);
+}
+
+#[test]
+fn goaway_rejects_new_stream_headers() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let goaway = frame(
+        FrameType::GoAway,
+        0,
+        StreamId::connection(),
+        FramePayload::GoAway {
+            last_stream_id: sid(1),
+            error_code: 0,
+            debug_data: Vec::new(),
+        },
+        8,
+    );
+    conn.receive_frame(&goaway).expect("goaway");
+
+    let new_stream = frame(
+        FrameType::Headers,
+        0,
+        sid(3),
+        FramePayload::Headers(vec![0x82]),
+        1,
+    );
+    let err = conn
+        .receive_frame(&new_stream)
+        .expect_err("new stream after GOAWAY must fail");
+    assert_eq!(err.from, ConnectionState::Closing);
+    assert_eq!(err.kind, ConnectionErrorKind::NewStreamAfterGoAway(sid(3)));
+}
+
+#[test]
+fn non_ack_ping_requests_ack_event_and_ack_is_consumed() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let opaque = *b"12345678";
+    let ping = frame(
+        FrameType::Ping,
+        0,
+        StreamId::connection(),
+        FramePayload::Ping { ack: false, opaque },
+        8,
+    );
+    assert_eq!(
+        conn.receive_frame(&ping).expect("ping"),
+        ConnectionEvent::PingAck { opaque }
+    );
+
+    let ping_ack = frame(
+        FrameType::Ping,
+        0x1,
+        StreamId::connection(),
+        FramePayload::Ping { ack: true, opaque },
+        8,
+    );
+    assert_eq!(
+        conn.receive_frame(&ping_ack).expect("ping ack"),
+        ConnectionEvent::None
+    );
 }
 
 #[test]

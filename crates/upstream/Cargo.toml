@@ -9,8 +9,10 @@ path = "src/lib.rs"
 
 [dependencies]
 fingerprint-proxy-core = { path = "../core" }
+fingerprint-proxy-hpack = { path = "../hpack" }
+fingerprint-proxy-http2 = { path = "../http2" }
 rustls = "0.22"
-tokio = { version = "1", features = ["net", "time", "io-util"] }
+tokio = { version = "1", features = ["net", "time", "io-util", "rt", "sync"] }
 tokio-rustls = "0.25"
 webpki-roots = "0.26"
 

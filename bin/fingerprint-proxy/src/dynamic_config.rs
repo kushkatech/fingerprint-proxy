@@ -1,5 +1,8 @@
-use fingerprint_proxy_bootstrap_config::certificates::LoadedTlsCertificates;
-use fingerprint_proxy_bootstrap_config::config::{DomainConfig, DynamicConfigProviderSettings};
+use crate::runtime::RuntimeTlsServerConfigs;
+use fingerprint_proxy_bootstrap_config::certificates::load_tls_certificates;
+use fingerprint_proxy_bootstrap_config::config::{
+    BootstrapConfig, DomainConfig, DynamicConfigProviderSettings,
+};
 use fingerprint_proxy_bootstrap_config::dynamic::atomic_update::{
     prepare_candidate_snapshot, ActiveSnapshotStore, CandidateSnapshot, DynamicConfigSnapshot,
     SnapshotActivation,
@@ -28,10 +31,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-const DEFAULT_DYNAMIC_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_UPSTREAM_CHECK_TIMEOUT: Duration = Duration::from_millis(250);
-const DEFAULT_UPSTREAM_CHECK_MODE: UpstreamConnectivityValidationMode =
-    UpstreamConnectivityValidationMode::Disabled;
 
 #[derive(Debug, Clone, Default)]
 pub struct SharedDynamicConfigState {
@@ -87,15 +87,21 @@ impl SharedDynamicConfigState {
     }
 }
 
-pub async fn run_dynamic_updates(
+pub(crate) async fn run_dynamic_updates(
     provider_settings: DynamicConfigProviderSettings,
     state: SharedDynamicConfigState,
-    loaded_certs: Arc<LoadedTlsCertificates>,
+    bootstrap_config: BootstrapConfig,
+    tls_server_configs: RuntimeTlsServerConfigs,
     stats: Arc<RuntimeStatsRegistry>,
     shutdown: watch::Receiver<bool>,
 ) -> FpResult<()> {
-    let updater =
-        DynamicConfigUpdater::new_for_runtime(provider_settings, state, loaded_certs, stats)?;
+    let updater = DynamicConfigUpdater::new_for_runtime(
+        provider_settings,
+        state,
+        bootstrap_config,
+        tls_server_configs,
+        stats,
+    )?;
     updater.run_until_shutdown(shutdown).await
 }
 
@@ -115,7 +121,8 @@ impl DynamicDomainConfigRetriever for DefaultDynamicDomainConfigRetriever {
 struct DynamicConfigUpdater {
     provider_kind: String,
     state: SharedDynamicConfigState,
-    loaded_certs: Arc<LoadedTlsCertificates>,
+    bootstrap_config: BootstrapConfig,
+    tls_server_configs: RuntimeTlsServerConfigs,
     stats: Arc<RuntimeStatsRegistry>,
     polling_config: PollingConfig,
     retriever: Arc<dyn DynamicDomainConfigRetriever>,
@@ -128,7 +135,8 @@ impl DynamicConfigUpdater {
     fn new_for_runtime(
         provider_settings: DynamicConfigProviderSettings,
         state: SharedDynamicConfigState,
-        loaded_certs: Arc<LoadedTlsCertificates>,
+        bootstrap_config: BootstrapConfig,
+        tls_server_configs: RuntimeTlsServerConfigs,
         stats: Arc<RuntimeStatsRegistry>,
     ) -> FpResult<Self> {
         validate_runtime_provider_kind(&provider_settings)?;
@@ -136,11 +144,14 @@ impl DynamicConfigUpdater {
         Ok(Self {
             provider_kind: provider_settings.kind,
             state,
-            loaded_certs,
+            bootstrap_config,
+            tls_server_configs,
             stats,
-            polling_config: PollingConfig::new(DEFAULT_DYNAMIC_POLL_INTERVAL)?,
+            polling_config: PollingConfig::new(Duration::from_secs(
+                provider_settings.polling_interval_seconds,
+            ))?,
             retriever: Arc::new(DefaultDynamicDomainConfigRetriever),
-            upstream_mode: DEFAULT_UPSTREAM_CHECK_MODE,
+            upstream_mode: provider_settings.upstream_connectivity_validation_mode,
             upstream_checker: Arc::new(checker),
             logger: Arc::new(StderrUpdateOperationLogger),
         })
@@ -304,9 +315,40 @@ impl DynamicConfigUpdater {
             }
         };
 
+        let reloaded_tls_certs = match load_tls_certificates(&self.bootstrap_config) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                self.log_failure(
+                    at_unix,
+                    UpdateOperation::Validation,
+                    active_revision.clone(),
+                    candidate_revision.clone(),
+                    &err,
+                );
+                return;
+            }
+        };
+
+        let prepared_tls_configs = match self
+            .tls_server_configs
+            .prepare_update(reloaded_tls_certs.clone())
+        {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.log_failure(
+                    at_unix,
+                    UpdateOperation::Validation,
+                    active_revision.clone(),
+                    candidate_revision.clone(),
+                    &err,
+                );
+                return;
+            }
+        };
+
         let validated_candidate = match validate_candidate_certificate_references(
             validated_candidate,
-            &self.loaded_certs,
+            &reloaded_tls_certs,
         ) {
             Ok(candidate) => candidate,
             Err(err) => {
@@ -372,12 +414,41 @@ impl DynamicConfigUpdater {
             .with_candidate_revision(candidate_revision.clone()),
         );
 
+        let tls_activation = match self.tls_server_configs.apply_prepared(prepared_tls_configs) {
+            Ok(activation) => activation,
+            Err(err) => {
+                self.log_failure(
+                    at_unix,
+                    UpdateOperation::Activation,
+                    active_revision.clone(),
+                    candidate_revision.clone(),
+                    &err,
+                );
+                return;
+            }
+        };
+
         let activation = match self
             .state
             .activate(prepare_candidate_snapshot(validated_candidate))
         {
             Ok(activation) => activation,
             Err(err) => {
+                if let Err(rollback_err) = self.tls_server_configs.restore_previous(tls_activation)
+                {
+                    self.log_event(
+                        UpdateLogEvent::new(
+                            UpdateOperation::Activation,
+                            UpdateOutcome::Failed,
+                            format!(
+                                "TLS material rollback failed after domain activation failure: kind={:?} message={}",
+                                rollback_err.kind, rollback_err.message
+                            ),
+                        )
+                        .with_active_revision(active_revision.clone())
+                        .with_candidate_revision(candidate_revision.clone()),
+                    );
+                }
                 self.log_failure(
                     at_unix,
                     UpdateOperation::Activation,
@@ -461,12 +532,19 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fingerprint_proxy_bootstrap_config::config::{FingerprintHeaderConfig, VirtualHostConfig};
+    use fingerprint_proxy_bootstrap_config::config::{
+        BootstrapConfig, CertificateRef,
+        DefaultCertificatePolicy as BootstrapDefaultCertificatePolicy, FingerprintHeaderConfig,
+        ListenerAcquisitionMode, ListenerConfig, ServerNamePattern, StatsApiAuthPolicy,
+        StatsApiConfig, StatsApiNetworkPolicy, SystemLimits, SystemTimeouts, TlsCertificateConfig,
+        UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
+        VirtualHostProtocolConfig, VirtualHostTlsConfig, DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+    };
     use fingerprint_proxy_core::error::ErrorKind;
     use fingerprint_proxy_core::identifiers::ConfigVersion;
     use fingerprint_proxy_stats_api::time_windows::EffectiveTimeWindow;
-    use fingerprint_proxy_tls_termination::config::{DefaultCertificatePolicy, TlsSelectionConfig};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
     fn domain_config(version: &str) -> DomainConfig {
@@ -484,13 +562,139 @@ mod tests {
         config
     }
 
-    fn empty_loaded_tls_certificates() -> LoadedTlsCertificates {
-        LoadedTlsCertificates {
-            selection: TlsSelectionConfig {
-                default_policy: DefaultCertificatePolicy::Reject,
-                certificates: Vec::new(),
-            },
-            keys_by_id: BTreeMap::new(),
+    fn domain_config_with_upstream(version: &str, cert_id: &str) -> DomainConfig {
+        DomainConfig {
+            version: ConfigVersion::new(version).expect("version"),
+            virtual_hosts: vec![VirtualHostConfig {
+                id: 1,
+                match_criteria: VirtualHostMatch {
+                    sni: vec![ServerNamePattern::Exact("dynamic.example.com".to_string())],
+                    destination: Vec::new(),
+                },
+                tls: VirtualHostTlsConfig {
+                    certificate: CertificateRef {
+                        id: cert_id.to_string(),
+                    },
+                    minimum_tls_version: None,
+                    cipher_suites: Vec::new(),
+                },
+                upstream: UpstreamConfig {
+                    protocol: UpstreamProtocol::Http,
+                    allowed_upstream_app_protocols: None,
+                    host: "blocked-upstream.example".to_string(),
+                    port: 8080,
+                },
+                protocol: VirtualHostProtocolConfig {
+                    allow_http1: true,
+                    allow_http2: true,
+                    allow_http3: false,
+                },
+                module_config: BTreeMap::new(),
+            }],
+            fingerprint_headers: FingerprintHeaderConfig::default(),
+            client_classification_rules: Vec::new(),
+        }
+    }
+
+    fn write_temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fp-dynamic-config-runtime-{id}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    struct TestTlsMaterial {
+        bootstrap_config: BootstrapConfig,
+        tls_server_configs: RuntimeTlsServerConfigs,
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
+    }
+
+    fn signed_leaf_pem(server_name: &str) -> (String, String) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new());
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        let ca = rcgen::Certificate::from_params(ca_params).expect("ca cert");
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![server_name.to_string()]);
+        leaf_params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        let leaf = rcgen::Certificate::from_params(leaf_params).expect("leaf cert");
+        let cert_pem = leaf.serialize_pem_with_signer(&ca).expect("leaf cert pem");
+        let key_pem = leaf.serialize_private_key_pem();
+        (cert_pem, key_pem)
+    }
+
+    impl TestTlsMaterial {
+        fn generate(cert_id: &str) -> Self {
+            let (cert_pem, key_pem) = signed_leaf_pem("dynamic.example.com");
+            let cert_path = write_temp_file("cert.pem", &cert_pem);
+            let key_path = write_temp_file("key.pem", &key_pem);
+
+            let bootstrap = BootstrapConfig {
+                listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+                listeners: vec![ListenerConfig {
+                    bind: "127.0.0.1:0".parse().expect("bind"),
+                }],
+                tls_certificates: vec![TlsCertificateConfig {
+                    id: cert_id.to_string(),
+                    certificate_pem_path: cert_path.to_string_lossy().to_string(),
+                    private_key_pem_path: key_path.to_string_lossy().to_string(),
+                    server_names: vec![ServerNamePattern::Exact("dynamic.example.com".to_string())],
+                }],
+                default_certificate_policy: BootstrapDefaultCertificatePolicy::UseDefault(
+                    CertificateRef {
+                        id: cert_id.to_string(),
+                    },
+                ),
+                dynamic_provider: None,
+                stats_api: StatsApiConfig {
+                    enabled: false,
+                    bind: "127.0.0.1:0".parse().expect("stats bind"),
+                    network_policy: StatsApiNetworkPolicy::Disabled,
+                    auth_policy: StatsApiAuthPolicy::Disabled,
+                },
+                timeouts: SystemTimeouts {
+                    upstream_connect_timeout: None,
+                    request_timeout: None,
+                },
+                limits: SystemLimits {
+                    max_header_bytes: None,
+                    max_body_bytes: None,
+                },
+                module_enabled: BTreeMap::new(),
+            };
+
+            let loaded = load_tls_certificates(&bootstrap).expect("load TLS certificate material");
+            let tls_server_configs =
+                RuntimeTlsServerConfigs::new(loaded.selection, loaded.keys_by_id)
+                    .expect("runtime TLS server configs");
+
+            Self {
+                bootstrap_config: bootstrap,
+                tls_server_configs,
+                cert_path,
+                key_path,
+            }
+        }
+
+        fn rotate_valid_leaf(&self) {
+            let (cert_pem, key_pem) = signed_leaf_pem("dynamic.example.com");
+            std::fs::write(&self.cert_path, cert_pem).expect("write rotated cert");
+            std::fs::write(&self.key_path, key_pem).expect("write rotated key");
+        }
+
+        fn rotate_invalid_leaf(&self) {
+            std::fs::write(&self.cert_path, "not a certificate").expect("write invalid cert");
+            std::fs::write(&self.key_path, "not a key").expect("write invalid key");
+        }
+
+        fn active_cert_der(&self, cert_id: &str) -> rustls::pki_types::CertificateDer<'static> {
+            self.tls_server_configs
+                .active_certificate_der_for_test(cert_id)
+                .expect("active cert")
         }
     }
 
@@ -544,49 +748,121 @@ mod tests {
         }
     }
 
+    struct FailingChecker;
+
+    impl UpstreamConnectivityChecker for FailingChecker {
+        fn check(
+            &self,
+            target: &fingerprint_proxy_bootstrap_config::dynamic::upstream_check::UpstreamValidationTarget,
+        ) -> FpResult<()> {
+            Err(FpError::validation_failed(format!(
+                "simulated connectivity failure for {}:{}",
+                target.host, target.port
+            )))
+        }
+    }
+
     fn test_updater(
         state: SharedDynamicConfigState,
         retriever: Arc<dyn DynamicDomainConfigRetriever>,
         logger: Arc<dyn UpdateOperationLogger>,
         stats: Arc<RuntimeStatsRegistry>,
     ) -> DynamicConfigUpdater {
+        let tls = TestTlsMaterial::generate("cert-a");
+        test_updater_with_upstream(
+            state,
+            retriever,
+            logger,
+            stats,
+            &tls,
+            UpstreamConnectivityValidationMode::Disabled,
+            Arc::new(PanicChecker),
+        )
+    }
+
+    fn test_updater_with_upstream(
+        state: SharedDynamicConfigState,
+        retriever: Arc<dyn DynamicDomainConfigRetriever>,
+        logger: Arc<dyn UpdateOperationLogger>,
+        stats: Arc<RuntimeStatsRegistry>,
+        tls: &TestTlsMaterial,
+        upstream_mode: UpstreamConnectivityValidationMode,
+        upstream_checker: Arc<dyn UpstreamConnectivityChecker + Send + Sync>,
+    ) -> DynamicConfigUpdater {
         DynamicConfigUpdater {
             provider_kind: "file".to_string(),
             state,
-            loaded_certs: Arc::new(empty_loaded_tls_certificates()),
+            bootstrap_config: tls.bootstrap_config.clone(),
+            tls_server_configs: tls.tls_server_configs.clone(),
             stats,
             polling_config: PollingConfig::new(Duration::from_secs(5)).expect("poll config"),
             retriever,
-            upstream_mode: UpstreamConnectivityValidationMode::Disabled,
-            upstream_checker: Arc::new(PanicChecker),
+            upstream_mode,
+            upstream_checker,
             logger,
         }
     }
 
     #[test]
     fn runtime_dynamic_updater_accepts_file_provider_kind() {
+        let tls = TestTlsMaterial::generate("cert-a");
         let updater = DynamicConfigUpdater::new_for_runtime(
             DynamicConfigProviderSettings {
                 kind: "file".to_string(),
+                polling_interval_seconds: DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+                upstream_connectivity_validation_mode: UpstreamConnectivityValidationMode::Disabled,
             },
             SharedDynamicConfigState::new(),
-            Arc::new(empty_loaded_tls_certificates()),
+            tls.bootstrap_config,
+            tls.tls_server_configs,
             Arc::new(RuntimeStatsRegistry::new()),
         )
         .expect("file provider kind should be accepted");
 
         assert_eq!(updater.provider_kind, "file");
+        assert_eq!(
+            updater.polling_config.interval(),
+            Duration::from_secs(DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn runtime_dynamic_updater_uses_configured_upstream_validation_mode_and_polling_interval() {
+        let tls = TestTlsMaterial::generate("cert-a");
+        let updater = DynamicConfigUpdater::new_for_runtime(
+            DynamicConfigProviderSettings {
+                kind: "file".to_string(),
+                polling_interval_seconds: 11,
+                upstream_connectivity_validation_mode: UpstreamConnectivityValidationMode::Strict,
+            },
+            SharedDynamicConfigState::new(),
+            tls.bootstrap_config,
+            tls.tls_server_configs,
+            Arc::new(RuntimeStatsRegistry::new()),
+        )
+        .expect("file provider kind should be accepted");
+
+        assert_eq!(
+            updater.upstream_mode,
+            UpstreamConnectivityValidationMode::Strict
+        );
+        assert_eq!(updater.polling_config.interval(), Duration::from_secs(11));
     }
 
     #[test]
     fn runtime_dynamic_updater_rejects_non_file_provider_kinds_before_retrieval() {
         for kind in ["api", "db", "database", "unknown"] {
+            let tls = TestTlsMaterial::generate("cert-a");
             let result = DynamicConfigUpdater::new_for_runtime(
                 DynamicConfigProviderSettings {
                     kind: kind.to_string(),
+                    polling_interval_seconds: DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+                    upstream_connectivity_validation_mode:
+                        UpstreamConnectivityValidationMode::Disabled,
                 },
                 SharedDynamicConfigState::new(),
-                Arc::new(empty_loaded_tls_certificates()),
+                tls.bootstrap_config,
+                tls.tls_server_configs,
                 Arc::new(RuntimeStatsRegistry::new()),
             );
             let err = match result {
@@ -606,12 +882,16 @@ mod tests {
 
     #[test]
     fn runtime_dynamic_updater_rejects_blank_provider_kind_before_retrieval() {
+        let tls = TestTlsMaterial::generate("cert-a");
         let result = DynamicConfigUpdater::new_for_runtime(
             DynamicConfigProviderSettings {
                 kind: " ".to_string(),
+                polling_interval_seconds: DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+                upstream_connectivity_validation_mode: UpstreamConnectivityValidationMode::Disabled,
             },
             SharedDynamicConfigState::new(),
-            Arc::new(empty_loaded_tls_certificates()),
+            tls.bootstrap_config,
+            tls.tls_server_configs,
             Arc::new(RuntimeStatsRegistry::new()),
         );
         let err = match result {
@@ -623,6 +903,32 @@ mod tests {
         assert_eq!(
             err.message,
             "dynamic provider kind must be non-empty for active runtime dynamic configuration"
+        );
+    }
+
+    #[test]
+    fn runtime_dynamic_updater_rejects_zero_polling_interval_before_retrieval() {
+        let tls = TestTlsMaterial::generate("cert-a");
+        let result = DynamicConfigUpdater::new_for_runtime(
+            DynamicConfigProviderSettings {
+                kind: "file".to_string(),
+                polling_interval_seconds: 0,
+                upstream_connectivity_validation_mode: UpstreamConnectivityValidationMode::Disabled,
+            },
+            SharedDynamicConfigState::new(),
+            tls.bootstrap_config,
+            tls.tls_server_configs,
+            Arc::new(RuntimeStatsRegistry::new()),
+        );
+        let err = match result {
+            Ok(_) => panic!("zero polling interval should fail runtime startup"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+        assert_eq!(
+            err.message,
+            "dynamic polling interval must be greater than zero"
         );
     }
 
@@ -694,6 +1000,236 @@ mod tests {
             event.operation == UpdateOperation::Validation
                 && event.outcome == UpdateOutcome::Failed
                 && event.detail.contains("ValidationFailed")
+        }));
+    }
+
+    #[test]
+    fn apply_once_invalid_rotated_certificate_blocks_activation_and_preserves_tls_material() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let old_cert = tls.active_cert_der(cert_id);
+        tls.rotate_invalid_leaf();
+
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
+            domain_config_with_upstream("rev-2", cert_id),
+        ))));
+        let updater = test_updater_with_upstream(
+            state.clone(),
+            retriever,
+            logger.clone(),
+            Arc::clone(&stats),
+            &tls,
+            UpstreamConnectivityValidationMode::Disabled,
+            Arc::new(PanicChecker),
+        );
+
+        updater.apply_once(250);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-1");
+        let active_cert = tls.active_cert_der(cert_id);
+        assert_eq!(active_cert.as_ref(), old_cert.as_ref());
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 250,
+            to: 250,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 0);
+        assert_eq!(counters.system.configuration_update_failures, 1);
+
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.operation == UpdateOperation::Validation
+                && event.outcome == UpdateOutcome::Failed
+                && event.detail.contains("TLS certificate loading failed")
+        }));
+    }
+
+    #[test]
+    fn apply_once_missing_certificate_reference_preserves_snapshot_and_tls_material() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let old_cert = tls.active_cert_der(cert_id);
+        tls.rotate_valid_leaf();
+
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
+            domain_config_with_upstream("rev-2", "missing-cert"),
+        ))));
+        let updater = test_updater_with_upstream(
+            state.clone(),
+            retriever,
+            logger.clone(),
+            Arc::clone(&stats),
+            &tls,
+            UpstreamConnectivityValidationMode::Disabled,
+            Arc::new(PanicChecker),
+        );
+
+        updater.apply_once(260);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-1");
+        let active_cert = tls.active_cert_der(cert_id);
+        assert_eq!(active_cert.as_ref(), old_cert.as_ref());
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 260,
+            to: 260,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 0);
+        assert_eq!(counters.system.configuration_update_failures, 1);
+
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.operation == UpdateOperation::Validation
+                && event.outcome == UpdateOutcome::Failed
+                && event
+                    .detail
+                    .contains("referenced TLS certificate id `missing-cert`")
+        }));
+    }
+
+    #[test]
+    fn apply_once_valid_dynamic_activation_publishes_rotated_tls_material() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let old_cert = tls.active_cert_der(cert_id);
+        tls.rotate_valid_leaf();
+
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
+            domain_config_with_upstream("rev-2", cert_id),
+        ))));
+        let updater = test_updater_with_upstream(
+            state.clone(),
+            retriever,
+            logger,
+            Arc::clone(&stats),
+            &tls,
+            UpstreamConnectivityValidationMode::Disabled,
+            Arc::new(PanicChecker),
+        );
+
+        updater.apply_once(270);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-2");
+        let active_cert = tls.active_cert_der(cert_id);
+        assert_ne!(active_cert.as_ref(), old_cert.as_ref());
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 270,
+            to: 270,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 1);
+        assert_eq!(counters.system.configuration_update_failures, 0);
+    }
+
+    #[test]
+    fn apply_once_disabled_upstream_validation_preserves_activation_behavior() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
+            domain_config_with_upstream("rev-2", cert_id),
+        ))));
+        let updater = test_updater_with_upstream(
+            state.clone(),
+            retriever,
+            logger.clone(),
+            Arc::clone(&stats),
+            &tls,
+            UpstreamConnectivityValidationMode::Disabled,
+            Arc::new(PanicChecker),
+        );
+
+        updater.apply_once(300);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-2");
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 300,
+            to: 300,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 1);
+        assert_eq!(counters.system.configuration_update_failures, 0);
+
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.operation == UpdateOperation::UpstreamCheck
+                && event.outcome == UpdateOutcome::Skipped
+                && event.detail == "upstream connectivity validation is disabled"
+        }));
+    }
+
+    #[test]
+    fn apply_once_strict_upstream_validation_failure_blocks_activation() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
+            domain_config_with_upstream("rev-2", cert_id),
+        ))));
+        let updater = test_updater_with_upstream(
+            state.clone(),
+            retriever,
+            logger.clone(),
+            Arc::clone(&stats),
+            &tls,
+            UpstreamConnectivityValidationMode::Strict,
+            Arc::new(FailingChecker),
+        );
+
+        updater.apply_once(301);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-1");
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 301,
+            to: 301,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 0);
+        assert_eq!(counters.system.configuration_update_failures, 1);
+
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.operation == UpdateOperation::UpstreamCheck
+                && event.outcome == UpdateOutcome::Failed
+                && event.detail.contains("simulated connectivity failure")
         }));
     }
 

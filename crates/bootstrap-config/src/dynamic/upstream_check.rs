@@ -4,8 +4,9 @@ use fingerprint_proxy_core::error::{FpError, FpResult, ValidationIssue, Validati
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamConnectivityValidationMode {
+    #[default]
     Disabled,
     Strict,
 }

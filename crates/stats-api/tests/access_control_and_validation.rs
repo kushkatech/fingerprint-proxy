@@ -111,6 +111,37 @@ fn access_control_checks_network_before_auth() {
 }
 
 #[test]
+fn access_control_requires_allowlist_before_credentials() {
+    let allowlist = vec![Cidr {
+        addr: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
+        prefix_len: 16,
+    }];
+    let cfg = mk_cfg(
+        true,
+        StatsApiNetworkPolicy::RequireAllowlist(allowlist),
+        StatsApiAuthPolicy::RequireCredentials(vec![Credential::BearerToken("secret".to_string())]),
+    );
+
+    let allowed_ip_missing_token = StatsApiRequestContext {
+        peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+        bearer_token: None,
+    };
+    assert!(!is_stats_request_allowed(&allowed_ip_missing_token, &cfg));
+
+    let denied_ip_valid_token = StatsApiRequestContext {
+        peer_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        bearer_token: Some("secret"),
+    };
+    assert!(!is_stats_request_allowed(&denied_ip_valid_token, &cfg));
+
+    let allowed_ip_valid_token = StatsApiRequestContext {
+        peer_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+        bearer_token: Some("secret"),
+    };
+    assert!(is_stats_request_allowed(&allowed_ip_valid_token, &cfg));
+}
+
+#[test]
 fn cidr_contains_supports_ipv4_and_ipv6() {
     let cidr_v4 = Cidr {
         addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
@@ -220,6 +251,33 @@ fn validation_warns_when_controls_disabled_while_enabled() {
             .count(),
         3
     );
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| i.path == "bootstrap.stats_api.network_policy"
+            && i.severity == IssueSeverity::Warning));
+    assert!(report.issues.iter().any(
+        |i| i.path == "bootstrap.stats_api.auth_policy" && i.severity == IssueSeverity::Warning
+    ));
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| i.path == "bootstrap.stats_api" && i.severity == IssueSeverity::Warning));
+}
+
+#[test]
+fn validation_accepts_configured_allowlist_and_credentials() {
+    let cfg = mk_cfg(
+        true,
+        StatsApiNetworkPolicy::RequireAllowlist(vec![Cidr {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            prefix_len: 32,
+        }]),
+        StatsApiAuthPolicy::RequireCredentials(vec![Credential::BearerToken("secret".to_string())]),
+    );
+
+    let report = validate_stats_api_config(&cfg);
+    assert_eq!(report, ValidationReport::default());
 }
 
 #[test]

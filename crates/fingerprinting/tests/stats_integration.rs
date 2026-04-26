@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 #[test]
-fn record_request_fingerprints_preserves_runtime_counter_semantics() {
+fn records_request_and_fingerprint_computation_counters_separately() {
     let runtime_stats = Arc::new(RuntimeStatsRegistry::new());
     let integration = FingerprintingStatsIntegration::new(Arc::clone(&runtime_stats));
     let result = compute_runtime_fingerprinting_result(
@@ -18,7 +18,9 @@ fn record_request_fingerprints_preserves_runtime_counter_semantics() {
         SystemTime::UNIX_EPOCH,
     );
 
-    integration.record_request_fingerprints(130, &result);
+    integration.record_request_processed(130);
+    integration.record_request_processed(130);
+    integration.record_fingerprint_computation(130, &result);
 
     let snapshot = runtime_stats.snapshot(&EffectiveTimeWindow {
         from: 100,
@@ -26,7 +28,7 @@ fn record_request_fingerprints_preserves_runtime_counter_semantics() {
         window_seconds: 50,
     });
 
-    assert_eq!(snapshot.system.requests_processed, 1);
+    assert_eq!(snapshot.system.requests_processed, 2);
     assert_eq!(snapshot.ja4t.0.attempts, 1);
     assert_eq!(snapshot.ja4t.0.failures, 1);
     assert_eq!(snapshot.ja4t.1.missing_data, 1);

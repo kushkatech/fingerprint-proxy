@@ -5,6 +5,39 @@ use fingerprint_proxy_health::endpoints::{
 };
 use fingerprint_proxy_health::liveness::{LivenessCheckInput, LivenessStatus};
 use fingerprint_proxy_health::readiness::{ReadinessCheckInput, ReadinessStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedRuntimeOperationalState {
+    supervision_failed: Arc<AtomicBool>,
+}
+
+impl SharedRuntimeOperationalState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_supervision_failed(&self) {
+        self.supervision_failed.store(true, Ordering::Release);
+    }
+
+    pub fn is_supervision_failed(&self) -> bool {
+        self.supervision_failed.load(Ordering::Acquire)
+    }
+
+    pub fn accept_loop_responsive(&self) -> bool {
+        !self.is_supervision_failed()
+    }
+
+    pub fn stats_status(&self) -> &'static str {
+        if self.is_supervision_failed() {
+            "degraded"
+        } else {
+            "ok"
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeHealthState {
@@ -157,6 +190,35 @@ mod tests {
             response.headers.get("Content-Type"),
             Some(&"application/json".to_string())
         );
+    }
+
+    #[test]
+    fn failed_supervision_maps_health_endpoints_to_unhealthy_responses() {
+        let runtime_state = RuntimeHealthState {
+            runtime_started: true,
+            accept_loop_responsive: false,
+            config_loaded: true,
+            upstreams_reachable: false,
+        };
+
+        let live = build_runtime_health_response("GET", "/health/live", runtime_state);
+        assert_eq!(live.status, Some(503));
+        assert_eq!(
+            std::str::from_utf8(&live.body).expect("utf8"),
+            "{\"status\":\"not_live\",\"reason\":\"accept_loop_unresponsive\"}"
+        );
+
+        let ready = build_runtime_health_response("GET", "/health/ready", runtime_state);
+        assert_eq!(ready.status, Some(503));
+        assert!(std::str::from_utf8(&ready.body)
+            .expect("utf8")
+            .contains("\"status\":\"not_ready\""));
+
+        let health = build_runtime_health_response("GET", "/health", runtime_state);
+        assert_eq!(health.status, Some(503));
+        assert!(std::str::from_utf8(&health.body)
+            .expect("utf8")
+            .contains("\"status\":\"degraded\""));
     }
 
     #[test]

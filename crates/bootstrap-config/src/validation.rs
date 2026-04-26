@@ -25,18 +25,56 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
         }
     }
 
-    if matches!(
-        config.stats_api.network_policy,
-        StatsApiNetworkPolicy::Disabled
-    ) || matches!(config.stats_api.auth_policy, StatsApiAuthPolicy::Disabled)
-    {
-        report.push(ValidationIssue {
-            severity: IssueSeverity::Warning,
-            path: "bootstrap.stats_api".to_string(),
-            message:
-                "statistics API access controls are disabled; this is intended for development/testing only"
-                    .to_string(),
-        });
+    if config.stats_api.enabled {
+        match &config.stats_api.network_policy {
+            StatsApiNetworkPolicy::Disabled => {
+                report.push(ValidationIssue {
+                    severity: IssueSeverity::Warning,
+                    path: "bootstrap.stats_api.network_policy".to_string(),
+                    message:
+                        "statistics API network restrictions are disabled; this is intended for development/testing only"
+                            .to_string(),
+                });
+            }
+            StatsApiNetworkPolicy::RequireAllowlist(cidrs) if cidrs.is_empty() => {
+                report.push(ValidationIssue::error(
+                    "bootstrap.stats_api.network_policy",
+                    "allowlist must be non-empty when network restrictions are required",
+                ));
+            }
+            StatsApiNetworkPolicy::RequireAllowlist(_) => {}
+        }
+
+        match &config.stats_api.auth_policy {
+            StatsApiAuthPolicy::Disabled => {
+                report.push(ValidationIssue {
+                    severity: IssueSeverity::Warning,
+                    path: "bootstrap.stats_api.auth_policy".to_string(),
+                    message:
+                        "statistics API authentication is disabled; this is intended for development/testing only"
+                            .to_string(),
+                });
+            }
+            StatsApiAuthPolicy::RequireCredentials(creds) if creds.is_empty() => {
+                report.push(ValidationIssue::error(
+                    "bootstrap.stats_api.auth_policy",
+                    "credentials must be non-empty when authentication is required",
+                ));
+            }
+            StatsApiAuthPolicy::RequireCredentials(_) => {}
+        }
+
+        if matches!(
+            config.stats_api.network_policy,
+            StatsApiNetworkPolicy::Disabled
+        ) && matches!(config.stats_api.auth_policy, StatsApiAuthPolicy::Disabled)
+        {
+            report.push(ValidationIssue {
+                severity: IssueSeverity::Warning,
+                path: "bootstrap.stats_api".to_string(),
+                message: "statistics API is enabled with both network restrictions and authentication disabled; this is intended for development/testing only".to_string(),
+            });
+        }
     }
 
     match &config.default_certificate_policy {
@@ -122,6 +160,13 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
                     "unsupported dynamic provider kind `{}`; only `file` is supported for active runtime dynamic configuration",
                     provider.kind
                 ),
+            ));
+        }
+
+        if provider.polling_interval_seconds == 0 {
+            report.push(ValidationIssue::error(
+                "bootstrap.dynamic_provider.polling_interval_seconds",
+                "dynamic polling interval must be greater than zero",
             ));
         }
     }

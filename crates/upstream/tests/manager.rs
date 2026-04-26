@@ -1,5 +1,6 @@
 use fingerprint_proxy_core::error::ErrorKind;
 use fingerprint_proxy_upstream::http2::{BoxedUpstreamIo, UpstreamTransport};
+use fingerprint_proxy_upstream::http2_session::{Http2SharedSession, Http2SharedSessionConfig};
 use fingerprint_proxy_upstream::manager::UpstreamConnectionManager;
 use fingerprint_proxy_upstream::pool::config::PoolSizeConfig;
 use fingerprint_proxy_upstream::pool::http1::Http1ReleaseOutcome;
@@ -8,7 +9,9 @@ use fingerprint_proxy_upstream::pool::timeouts::PoolTimeoutConfig;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::DuplexStream;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 fn make_tls_pair(
@@ -51,6 +54,16 @@ fn make_tls_pair(
     server.alpn_protocols = alpn_protocols;
 
     (Arc::new(client), Arc::new(server), "localhost".to_string())
+}
+
+fn make_shared_session() -> (Http2SharedSession, DuplexStream, JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let (session, owner) = Http2SharedSession::spawn(
+        client_io,
+        Http2SharedSessionConfig::new(4, 8, 4).expect("shared session config"),
+    )
+    .expect("spawn shared session");
+    (session, server_io, owner)
 }
 
 #[tokio::test]
@@ -480,4 +493,235 @@ async fn manager_http2_release_after_exclusive_checkout_reports_pool_full_withou
         next_stream_id, 1,
         "pool-full release must drop the returned connection and keep the existing pooled entry"
     );
+}
+
+#[tokio::test]
+async fn cloned_managers_share_pool_state() {
+    let manager = UpstreamConnectionManager::with_system_roots();
+    let clone = manager.clone();
+    let io: BoxedUpstreamIo = {
+        let (a, _b) = tokio::io::duplex(64);
+        Box::new(a)
+    };
+
+    assert_eq!(
+        manager.release_http1_pooled(
+            "pool.example.test",
+            443,
+            UpstreamTransport::Https,
+            io,
+            true,
+            10,
+        ),
+        Http1ReleaseOutcome::Pooled
+    );
+    assert_eq!(
+        clone.pooled_http1_idle_count("pool.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+
+    let (_reused_io, reused) = clone
+        .connect_http1_pooled("pool.example.test", 443, UpstreamTransport::Https, 11)
+        .await
+        .expect("clone should reuse original manager pool state")
+        .into_parts();
+    assert!(reused);
+    assert_eq!(
+        manager.pooled_http1_idle_count("pool.example.test", 443, UpstreamTransport::Https),
+        0
+    );
+}
+
+#[tokio::test]
+async fn manager_http2_shared_session_registry_tracks_multiple_live_sessions_per_key_and_limit() {
+    let manager = UpstreamConnectionManager::new_with_pooling(
+        fingerprint_proxy_upstream::http2::default_tls_client_config(),
+        PoolSizeConfig::new(8, 2, 4).expect("pool size"),
+        PoolTimeoutConfig::default(),
+    )
+    .expect("manager");
+    let (session_one, server_one, owner_one) = make_shared_session();
+    let (session_two, server_two, owner_two) = make_shared_session();
+    let (session_three, server_three, owner_three) = make_shared_session();
+    let (session_other, server_other, owner_other) = make_shared_session();
+
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_one.clone(),
+    ));
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_two.clone(),
+    ));
+    assert!(!manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_three.clone(),
+    ));
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "other.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_other.clone(),
+    ));
+
+    let registered =
+        manager.http2_shared_sessions("api.example.test", 443, UpstreamTransport::Https);
+    assert_eq!(registered.len(), 2);
+    assert!(registered
+        .iter()
+        .any(|candidate| candidate.is_same_session(&session_one)));
+    assert!(registered
+        .iter()
+        .any(|candidate| candidate.is_same_session(&session_two)));
+    assert!(!registered
+        .iter()
+        .any(|candidate| candidate.is_same_session(&session_three)));
+    assert_eq!(
+        manager.http2_shared_session_count("api.example.test", 443, UpstreamTransport::Https),
+        2
+    );
+    assert_eq!(
+        manager.http2_shared_session_count("other.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+
+    drop(manager);
+    drop(registered);
+    drop(session_one);
+    drop(session_two);
+    drop(session_three);
+    drop(session_other);
+    drop(server_one);
+    drop(server_two);
+    drop(server_three);
+    drop(server_other);
+    owner_one.await.expect("owner one");
+    owner_two.await.expect("owner two");
+    owner_three.await.expect("owner three");
+    owner_other.await.expect("owner other");
+}
+
+#[tokio::test]
+async fn manager_http2_shared_session_registry_exact_removal_preserves_other_sessions() {
+    let manager = UpstreamConnectionManager::new_with_pooling(
+        fingerprint_proxy_upstream::http2::default_tls_client_config(),
+        PoolSizeConfig::new(8, 3, 4).expect("pool size"),
+        PoolTimeoutConfig::default(),
+    )
+    .expect("manager");
+    let (session_one, server_one, owner_one) = make_shared_session();
+    let (session_two, server_two, owner_two) = make_shared_session();
+    let (session_other, server_other, owner_other) = make_shared_session();
+
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_one.clone(),
+    ));
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_two.clone(),
+    ));
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "other.example.test",
+        443,
+        UpstreamTransport::Https,
+        session_other.clone(),
+    ));
+    assert_eq!(
+        manager.http2_shared_session_count("api.example.test", 443, UpstreamTransport::Https),
+        2
+    );
+    assert_eq!(
+        manager.http2_shared_session_count("other.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+
+    assert!(manager.remove_http2_shared_session(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        &session_one
+    ));
+    let remaining =
+        manager.http2_shared_sessions("api.example.test", 443, UpstreamTransport::Https);
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].is_same_session(&session_two));
+    assert!(manager
+        .http2_shared_session("other.example.test", 443, UpstreamTransport::Https)
+        .expect("other key remains registered")
+        .is_same_session(&session_other));
+    assert!(!manager.remove_http2_shared_session(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        &session_one
+    ));
+
+    drop(manager);
+    drop(remaining);
+    drop(session_one);
+    drop(session_two);
+    drop(session_other);
+    drop(server_one);
+    drop(server_two);
+    drop(server_other);
+    owner_one.await.expect("owner one");
+    owner_two.await.expect("owner two");
+    owner_other.await.expect("owner other");
+}
+
+#[tokio::test]
+async fn manager_http2_shared_session_registry_does_not_return_closed_sessions() {
+    let manager = UpstreamConnectionManager::new_with_pooling(
+        fingerprint_proxy_upstream::http2::default_tls_client_config(),
+        PoolSizeConfig::new(8, 2, 4).expect("pool size"),
+        PoolTimeoutConfig::default(),
+    )
+    .expect("manager");
+    let (closed_session, closed_server, closed_owner) = make_shared_session();
+    let (live_session, live_server, live_owner) = make_shared_session();
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        closed_session.clone(),
+    ));
+    assert!(manager.insert_http2_shared_session_if_below_limit(
+        "api.example.test",
+        443,
+        UpstreamTransport::Https,
+        live_session.clone(),
+    ));
+    assert_eq!(
+        manager.http2_shared_session_count("api.example.test", 443, UpstreamTransport::Https),
+        2
+    );
+
+    drop(closed_server);
+    closed_owner.await.expect("closed owner");
+    assert!(!closed_session.is_open());
+    let live = manager.http2_shared_sessions("api.example.test", 443, UpstreamTransport::Https);
+    assert_eq!(live.len(), 1);
+    assert!(live[0].is_same_session(&live_session));
+    assert_eq!(
+        manager.http2_shared_session_count("api.example.test", 443, UpstreamTransport::Https),
+        1
+    );
+
+    drop(manager);
+    drop(live);
+    drop(closed_session);
+    drop(live_session);
+    drop(live_server);
+    live_owner.await.expect("live owner");
 }

@@ -1,4 +1,5 @@
 use crate::http2::{BoxedUpstreamIo, Http2Connector, UpstreamTransport};
+use crate::http2_session::Http2SharedSession;
 use crate::ipv6::{upstream_connect_target, upstream_tls_server_name};
 use crate::ipv6_routing::{connect_tcp_with_routing, AddressFamilyPreference};
 use crate::pool::config::PoolSizeConfig;
@@ -8,6 +9,7 @@ use crate::pool::manager::{Http2StreamHandle, PoolTransport, UpstreamPoolKey};
 use crate::pool::per_upstream::{EvictedCounts, PerUpstreamPools};
 use crate::pool::timeouts::PoolTimeoutConfig;
 use crate::{FpError, FpResult, UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -34,12 +36,36 @@ impl Http2PooledAcquire {
     }
 }
 
+pub struct Http2SharedSessionAcquire {
+    session: Http2SharedSession,
+    reused: bool,
+}
+
+impl Http2SharedSessionAcquire {
+    pub fn into_parts(self) -> (Http2SharedSession, bool) {
+        (self.session, self.reused)
+    }
+
+    pub fn session(&self) -> &Http2SharedSession {
+        &self.session
+    }
+
+    pub fn reused(&self) -> bool {
+        self.reused
+    }
+}
+
 pub struct UpstreamConnectionManager {
     tls_client_config: Arc<rustls::ClientConfig>,
     http2_connector: Http2Connector,
-    pool_size_config: PoolSizeConfig,
-    pool_timeout_config: PoolTimeoutConfig,
+    state: Arc<UpstreamConnectionManagerState>,
+}
+
+struct UpstreamConnectionManagerState {
+    pool_size: PoolSizeConfig,
     pools: Mutex<PerUpstreamPools<PooledHttp1Connection, PooledHttp2Connection>>,
+    http2_shared_sessions: Mutex<HashMap<UpstreamPoolKey, Vec<Http2SharedSession>>>,
+    http2_shared_session_create_locks: Mutex<HashMap<UpstreamPoolKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl UpstreamConnectionManager {
@@ -62,9 +88,12 @@ impl UpstreamConnectionManager {
         Ok(Self {
             tls_client_config,
             http2_connector,
-            pool_size_config: size,
-            pool_timeout_config: timeouts,
-            pools: Mutex::new(pools),
+            state: Arc::new(UpstreamConnectionManagerState {
+                pool_size: size,
+                pools: Mutex::new(pools),
+                http2_shared_sessions: Mutex::new(HashMap::new()),
+                http2_shared_session_create_locks: Mutex::new(HashMap::new()),
+            }),
         })
     }
 
@@ -91,6 +120,7 @@ impl UpstreamConnectionManager {
     ) -> FpResult<Http1PooledAcquire> {
         let key = upstream_key(upstream_host, upstream_port, transport);
         if let Some(pooled) = self
+            .state
             .pools
             .lock()
             .expect("upstream pool mutex poisoned")
@@ -118,7 +148,8 @@ impl UpstreamConnectionManager {
         now_unix: u64,
     ) -> Http1ReleaseOutcome {
         let key = upstream_key(upstream_host, upstream_port, transport);
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .release_http1(
@@ -149,7 +180,8 @@ impl UpstreamConnectionManager {
         now_unix: u64,
         next_stream_id: u32,
     ) -> Http2InsertOutcome {
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .insert_http2_connection(
@@ -170,14 +202,16 @@ impl UpstreamConnectionManager {
         now_unix: u64,
     ) -> Option<Http2StreamHandle> {
         let key = upstream_key(upstream_host, upstream_port, transport);
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .try_acquire_http2_stream(&key, now_unix)
     }
 
     pub fn release_http2_stream_pooled(&self, handle: Http2StreamHandle, now_unix: u64) -> bool {
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .release_http2_stream(handle, now_unix)
@@ -217,7 +251,8 @@ impl UpstreamConnectionManager {
         now_unix: u64,
     ) -> Option<Http2PooledAcquire> {
         let key = upstream_key(upstream_host, upstream_port, transport);
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .take_idle_http2_connection(&key, now_unix)
@@ -245,7 +280,8 @@ impl UpstreamConnectionManager {
     }
 
     pub fn evict_expired_pooled(&self, now_unix: u64) -> EvictedCounts {
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .evict_expired(now_unix)
@@ -258,7 +294,8 @@ impl UpstreamConnectionManager {
         transport: UpstreamTransport,
     ) -> usize {
         let key = upstream_key(upstream_host, upstream_port, transport);
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .http1_idle_count(&key)
@@ -271,10 +308,169 @@ impl UpstreamConnectionManager {
         transport: UpstreamTransport,
     ) -> usize {
         let key = upstream_key(upstream_host, upstream_port, transport);
-        self.pools
+        self.state
+            .pools
             .lock()
             .expect("upstream pool mutex poisoned")
             .http2_connection_count(&key)
+    }
+
+    pub fn get_or_insert_http2_shared_session(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+        candidate: Http2SharedSession,
+    ) -> Http2SharedSessionAcquire {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut sessions = self
+            .state
+            .http2_shared_sessions
+            .lock()
+            .expect("upstream HTTP/2 shared session registry mutex poisoned");
+
+        let entry = sessions.entry(key).or_default();
+        entry.retain(Http2SharedSession::is_open);
+        if let Some(session) = entry.first() {
+            return Http2SharedSessionAcquire {
+                session: session.clone(),
+                reused: true,
+            };
+        }
+
+        entry.push(candidate.clone());
+        Http2SharedSessionAcquire {
+            session: candidate,
+            reused: false,
+        }
+    }
+
+    pub fn http2_shared_session_config(&self) -> crate::http2_session::Http2SharedSessionConfig {
+        let defaults = crate::http2_session::Http2SharedSessionConfig::default();
+        crate::http2_session::Http2SharedSessionConfig::new(
+            self.state.pool_size.http2_max_streams_per_connection,
+            defaults.command_queue_capacity,
+            defaults.stream_frame_capacity,
+        )
+        .expect("validated pool size must produce a valid HTTP/2 shared-session config")
+    }
+
+    pub fn http2_shared_session_connection_limit(&self) -> usize {
+        self.state.pool_size.http2_max_connections_per_upstream
+    }
+
+    pub fn http2_shared_sessions(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+    ) -> Vec<Http2SharedSession> {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut sessions = self
+            .state
+            .http2_shared_sessions
+            .lock()
+            .expect("upstream HTTP/2 shared session registry mutex poisoned");
+        prune_http2_shared_sessions_for_key(&mut sessions, &key);
+        sessions.get(&key).cloned().unwrap_or_default()
+    }
+
+    pub fn insert_http2_shared_session_if_below_limit(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+        candidate: Http2SharedSession,
+    ) -> bool {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut sessions = self
+            .state
+            .http2_shared_sessions
+            .lock()
+            .expect("upstream HTTP/2 shared session registry mutex poisoned");
+        let entry = sessions.entry(key).or_default();
+        entry.retain(Http2SharedSession::is_open);
+        if entry.len() >= self.state.pool_size.http2_max_connections_per_upstream {
+            return false;
+        }
+        entry.push(candidate);
+        true
+    }
+
+    pub fn http2_shared_session(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+    ) -> Option<Http2SharedSession> {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut sessions = self
+            .state
+            .http2_shared_sessions
+            .lock()
+            .expect("upstream HTTP/2 shared session registry mutex poisoned");
+        prune_http2_shared_sessions_for_key(&mut sessions, &key);
+        sessions
+            .get(&key)
+            .and_then(|sessions| sessions.first().cloned())
+    }
+
+    pub fn remove_http2_shared_session(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+        session: &Http2SharedSession,
+    ) -> bool {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut sessions = self
+            .state
+            .http2_shared_sessions
+            .lock()
+            .expect("upstream HTTP/2 shared session registry mutex poisoned");
+        prune_http2_shared_sessions_for_key(&mut sessions, &key);
+        let Some(registered) = sessions.get_mut(&key) else {
+            return false;
+        };
+        if let Some(index) = registered
+            .iter()
+            .position(|candidate| candidate.is_same_session(session))
+        {
+            registered.remove(index);
+            if registered.is_empty() {
+                sessions.remove(&key);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn http2_shared_session_count(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+    ) -> usize {
+        self.http2_shared_sessions(upstream_host, upstream_port, transport)
+            .len()
+    }
+
+    pub fn http2_shared_session_create_lock(
+        &self,
+        upstream_host: &str,
+        upstream_port: u16,
+        transport: UpstreamTransport,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = upstream_key(upstream_host, upstream_port, transport);
+        let mut locks = self
+            .state
+            .http2_shared_session_create_locks
+            .lock()
+            .expect("upstream HTTP/2 shared session create lock mutex poisoned");
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     async fn connect_http1_direct(
@@ -321,12 +517,11 @@ impl UpstreamConnectionManager {
 
 impl Clone for UpstreamConnectionManager {
     fn clone(&self) -> Self {
-        Self::new_with_pooling(
-            Arc::clone(&self.tls_client_config),
-            self.pool_size_config,
-            self.pool_timeout_config,
-        )
-        .expect("pool clone configuration must be valid")
+        Self {
+            tls_client_config: Arc::clone(&self.tls_client_config),
+            http2_connector: self.http2_connector.clone(),
+            state: Arc::clone(&self.state),
+        }
     }
 }
 
@@ -364,4 +559,16 @@ impl PooledHttp2Connection {
 
 fn upstream_key(host: &str, port: u16, transport: UpstreamTransport) -> UpstreamPoolKey {
     UpstreamPoolKey::new(host, port, PoolTransport::from(transport))
+}
+
+fn prune_http2_shared_sessions_for_key(
+    sessions: &mut HashMap<UpstreamPoolKey, Vec<Http2SharedSession>>,
+    key: &UpstreamPoolKey,
+) {
+    if let Some(registered) = sessions.get_mut(key) {
+        registered.retain(Http2SharedSession::is_open);
+        if registered.is_empty() {
+            sessions.remove(key);
+        }
+    }
 }

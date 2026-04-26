@@ -261,10 +261,28 @@ fn h2_headers_only_request_bytes(stream_id: u32) -> Vec<u8> {
     serialize_frame(&frame).expect("serialize frame")
 }
 
-fn h2_preface_and_frame(frame_bytes: &[u8]) -> Vec<u8> {
+fn h2_settings_frame_bytes() -> Vec<u8> {
+    let frame = Frame {
+        header: FrameHeader {
+            length: 0,
+            frame_type: FrameType::Settings,
+            flags: 0,
+            stream_id: fingerprint_proxy_http2::StreamId::connection(),
+        },
+        payload: FramePayload::Settings {
+            ack: false,
+            settings: fingerprint_proxy_http2::Settings::new(Vec::new()),
+        },
+    };
+    serialize_frame(&frame).expect("serialize settings frame")
+}
+
+fn h2_preface_and_frames(frames: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(fingerprint_proxy_http2::ConnectionPreface::CLIENT_BYTES);
-    out.extend_from_slice(frame_bytes);
+    for frame_bytes in frames {
+        out.extend_from_slice(frame_bytes);
+    }
     out
 }
 
@@ -315,8 +333,8 @@ async fn http2_dispatcher_parser_integration_routes_headers_frame() {
     let pipeline = Pipeline::new(vec![Box::new(TerminateModule)]);
     let mut deps = make_test_deps(&pipeline);
 
-    let frame_bytes = h2_headers_only_request_bytes(1);
-    let bytes = h2_preface_and_frame(&frame_bytes);
+    let bytes =
+        h2_preface_and_frames(&[h2_settings_frame_bytes(), h2_headers_only_request_bytes(1)]);
     let split = 9usize.min(bytes.len());
     let (first, second) = bytes.split_at(split);
 

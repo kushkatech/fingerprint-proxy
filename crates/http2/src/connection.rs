@@ -28,6 +28,14 @@ pub enum ConnectionOperation {
 pub enum ConnectionEvent {
     None,
     AckSettings,
+    PingAck {
+        opaque: [u8; 8],
+    },
+    ReplenishInboundWindow {
+        stream_id: StreamId,
+        connection_increment: u32,
+        stream_increment: u32,
+    },
     GoAwayReceived {
         last_stream_id: StreamId,
         error_code: u32,
@@ -41,6 +49,12 @@ pub enum ConnectionErrorKind {
     LocalSettingsAckPending,
     UnexpectedSettingsAck,
     FlowControl(FlowControlError),
+    NewStreamAfterGoAway(StreamId),
+    InvalidClientInitiatedStreamId(StreamId),
+    NonIncreasingClientStreamId {
+        stream_id: StreamId,
+        last_stream_id: StreamId,
+    },
     UnknownStream(StreamId),
     StreamAlreadyClosed(StreamId),
 }
@@ -176,6 +190,16 @@ impl Http2Connection {
                 ConnectionErrorKind::InvalidPreface,
             ));
         }
+        if self.state == ConnectionState::Closing
+            && matches!(frame.payload, FramePayload::Headers(_))
+            && !self.streams.contains_key(&frame.header.stream_id)
+        {
+            return Err(ConnectionError::invalid(
+                self.state,
+                ConnectionOperation::ReceiveFrame,
+                ConnectionErrorKind::NewStreamAfterGoAway(frame.header.stream_id),
+            ));
+        }
 
         match &frame.payload {
             FramePayload::Settings { ack, settings } => {
@@ -248,10 +272,18 @@ impl Http2Connection {
                 self.set_stream_closed(frame.header.stream_id)?;
                 Ok(ConnectionEvent::None)
             }
+            FramePayload::Ping { ack, opaque } => {
+                if *ack {
+                    Ok(ConnectionEvent::None)
+                } else {
+                    Ok(ConnectionEvent::PingAck { opaque: *opaque })
+                }
+            }
             FramePayload::Data(bytes) => {
                 self.ensure_known_open_stream(frame.header.stream_id)?;
+                let consumed = bytes.len() as u32;
                 self.flow_control
-                    .consume_data(frame.header.stream_id, bytes.len() as u32)
+                    .consume_data(frame.header.stream_id, consumed)
                     .map_err(|err| {
                         ConnectionError::invalid(
                             self.state,
@@ -262,7 +294,27 @@ impl Http2Connection {
                 if (frame.header.flags & FLAG_END_STREAM) != 0 {
                     self.mark_remote_end_stream(frame.header.stream_id)?;
                 }
-                Ok(ConnectionEvent::None)
+                if consumed == 0 {
+                    return Ok(ConnectionEvent::None);
+                }
+                self.flow_control
+                    .apply_connection_window_update(consumed)
+                    .and_then(|_| {
+                        self.flow_control
+                            .apply_stream_window_update(frame.header.stream_id, consumed)
+                    })
+                    .map_err(|err| {
+                        ConnectionError::invalid(
+                            self.state,
+                            ConnectionOperation::ReceiveFrame,
+                            ConnectionErrorKind::FlowControl(err),
+                        )
+                    })?;
+                Ok(ConnectionEvent::ReplenishInboundWindow {
+                    stream_id: frame.header.stream_id,
+                    connection_increment: consumed,
+                    stream_increment: consumed,
+                })
             }
             FramePayload::Headers(_) => {
                 self.ensure_stream(frame.header.stream_id).map_err(|kind| {
@@ -273,10 +325,14 @@ impl Http2Connection {
                 }
                 Ok(ConnectionEvent::None)
             }
-            FramePayload::Priority(_)
-            | FramePayload::PushPromise(_)
-            | FramePayload::Ping { ack: _, opaque: _ }
-            | FramePayload::Continuation(_) => Ok(ConnectionEvent::None),
+            FramePayload::Continuation(_) => {
+                self.ensure_known_open_stream(frame.header.stream_id)?;
+                if (frame.header.flags & FLAG_END_STREAM) != 0 {
+                    self.mark_remote_end_stream(frame.header.stream_id)?;
+                }
+                Ok(ConnectionEvent::None)
+            }
+            FramePayload::Priority(_) | FramePayload::PushPromise(_) => Ok(ConnectionEvent::None),
         }
     }
 
@@ -294,10 +350,27 @@ impl Http2Connection {
 
     fn ensure_stream(&mut self, stream_id: StreamId) -> Result<(), ConnectionErrorKind> {
         if let Some(state) = self.streams.get(&stream_id).copied() {
-            if state == StreamState::Closed {
-                return Err(ConnectionErrorKind::StreamAlreadyClosed(stream_id));
+            match state {
+                StreamState::Open => return Ok(()),
+                StreamState::Idle
+                | StreamState::HalfClosedLocal
+                | StreamState::HalfClosedRemote
+                | StreamState::Closed => {
+                    return Err(ConnectionErrorKind::StreamAlreadyClosed(stream_id));
+                }
             }
-            return Ok(());
+        }
+
+        if stream_id.is_connection() || stream_id.as_u32().is_multiple_of(2) {
+            return Err(ConnectionErrorKind::InvalidClientInitiatedStreamId(
+                stream_id,
+            ));
+        }
+        if stream_id <= self.last_stream_id {
+            return Err(ConnectionErrorKind::NonIncreasingClientStreamId {
+                stream_id,
+                last_stream_id: self.last_stream_id,
+            });
         }
 
         self.flow_control
@@ -316,7 +389,7 @@ impl Http2Connection {
                 ConnectionErrorKind::UnknownStream(stream_id),
             )
         })?;
-        if state == StreamState::Closed {
+        if matches!(state, StreamState::HalfClosedRemote | StreamState::Closed) {
             return Err(ConnectionError::invalid(
                 self.state,
                 ConnectionOperation::ReceiveFrame,
