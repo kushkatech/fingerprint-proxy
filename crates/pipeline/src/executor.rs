@@ -2,7 +2,7 @@ use crate::module::{PipelineModule, PipelineModuleResult};
 use crate::response::is_complete_response;
 use fingerprint_proxy_core::enrichment::{ModuleDecision, ProcessingStage};
 use fingerprint_proxy_core::error::{FpError, ValidationIssue, ValidationReport};
-use fingerprint_proxy_core::request::RequestContext;
+use fingerprint_proxy_core::request::{PipelineModuleContext, RequestContext};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +174,8 @@ impl Pipeline {
 }
 
 fn run_module(module: &dyn PipelineModule, ctx: &mut RequestContext) -> PipelineModuleResult {
-    module.handle(ctx)
+    let mut module_ctx = PipelineModuleContext::new(ctx);
+    module.handle(&mut module_ctx)
 }
 
 fn resolve_order(

@@ -74,6 +74,8 @@ pub struct SystemLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapConfig {
     pub listener_acquisition_mode: ListenerAcquisitionMode,
+    pub enable_http3_quic_listeners: bool,
+    pub fingerprinting: FingerprintingConfig,
     pub listeners: Vec<ListenerConfig>,
     pub tls_certificates: Vec<TlsCertificateConfig>,
     pub default_certificate_policy: DefaultCertificatePolicy,
@@ -84,12 +86,63 @@ pub struct BootstrapConfig {
     pub module_enabled: BTreeMap<String, bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FingerprintingConfig {
+    pub ja4t: Ja4TConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Ja4TConfig {
+    pub missing_tcp_metadata_policy: Ja4TMissingTcpMetadataPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ja4TMissingTcpMetadataPolicy {
+    #[default]
+    FailStartup,
+    AllowUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsCertificateConfig {
     pub id: String,
     pub certificate_pem_path: String,
-    pub private_key_pem_path: String,
+    pub private_key_provider: TlsPrivateKeyProviderConfig,
     pub server_names: Vec<ServerNamePattern>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsPrivateKeyProviderConfig {
+    File(TlsPrivateKeyFileProviderConfig),
+    KnownUnsupported(TlsPrivateKeyKnownUnsupportedProviderKind),
+    Unknown(TlsPrivateKeyUnknownProviderConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsPrivateKeyFileProviderConfig {
+    pub pem_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsPrivateKeyKnownUnsupportedProviderKind {
+    Pkcs11,
+    Kms,
+    Tpm,
+}
+
+impl TlsPrivateKeyKnownUnsupportedProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pkcs11 => "pkcs11",
+            Self::Kms => "kms",
+            Self::Tpm => "tpm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsPrivateKeyUnknownProviderConfig {
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +223,13 @@ pub struct VirtualHostProtocolConfig {
     pub allow_http1: bool,
     pub allow_http2: bool,
     pub allow_http3: bool,
+    pub http2_server_push_policy: Http2ServerPushPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Http2ServerPushPolicy {
+    Suppress,
+    Forward,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

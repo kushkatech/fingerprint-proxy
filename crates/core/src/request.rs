@@ -55,7 +55,7 @@ pub struct RequestContext {
     pub id: RequestId,
     pub connection: ConnectionContext,
     pub stage: ProcessingStage,
-    pub fingerprinting_result: Option<FingerprintComputationResult>,
+    fingerprinting_result: Option<FingerprintComputationResult>,
     pub client_network_rules: Vec<ClientNetworkClassificationRule>,
     pub enrichment: RequestEnrichment,
     pub request: HttpRequest,
@@ -80,5 +80,54 @@ impl RequestContext {
             module_config: BTreeMap::new(),
             pipeline_state: PipelineExecutionState::default(),
         }
+    }
+
+    pub fn with_fingerprinting_result(mut self, result: FingerprintComputationResult) -> Self {
+        self.fingerprinting_result = Some(result);
+        self
+    }
+
+    pub fn fingerprinting_result(&self) -> Option<&FingerprintComputationResult> {
+        self.fingerprinting_result.as_ref()
+    }
+}
+
+pub struct PipelineModuleContext<'a> {
+    pub id: RequestId,
+    pub connection: &'a ConnectionContext,
+    pub stage: ProcessingStage,
+    pub client_network_rules: &'a mut Vec<ClientNetworkClassificationRule>,
+    pub enrichment: &'a mut RequestEnrichment,
+    pub request: &'a mut HttpRequest,
+    pub response: &'a mut HttpResponse,
+    pub virtual_host: &'a mut Option<VirtualHostContext>,
+    pub module_config: &'a mut BTreeMap<String, BTreeMap<String, String>>,
+    pub pipeline_state: &'a mut PipelineExecutionState,
+    fingerprinting_result: Option<&'a FingerprintComputationResult>,
+}
+
+impl<'a> PipelineModuleContext<'a> {
+    pub fn new(ctx: &'a mut RequestContext) -> Self {
+        Self {
+            id: ctx.id,
+            connection: &ctx.connection,
+            stage: ctx.stage,
+            client_network_rules: &mut ctx.client_network_rules,
+            enrichment: &mut ctx.enrichment,
+            request: &mut ctx.request,
+            response: &mut ctx.response,
+            virtual_host: &mut ctx.virtual_host,
+            module_config: &mut ctx.module_config,
+            pipeline_state: &mut ctx.pipeline_state,
+            fingerprinting_result: ctx.fingerprinting_result.as_ref(),
+        }
+    }
+
+    pub fn fingerprinting_result(&self) -> Option<&FingerprintComputationResult> {
+        self.fingerprinting_result
+    }
+
+    pub fn replace_request(&mut self, request: HttpRequest) {
+        *self.request = request;
     }
 }

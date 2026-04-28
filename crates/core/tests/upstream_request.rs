@@ -88,8 +88,7 @@ fn injects_headers_when_result_present_and_complete() {
         computed_at,
     );
 
-    let mut ctx = make_ctx();
-    ctx.fingerprinting_result = Some(result);
+    let ctx = make_ctx().with_fingerprinting_result(result);
 
     let prepared = prepare_upstream_request(&ctx, &FingerprintHeaderConfig::default()).expect("ok");
 
@@ -141,8 +140,7 @@ fn partial_or_unavailable_does_not_inject_headers() {
         computed_at,
     );
 
-    let mut ctx = make_ctx();
-    ctx.fingerprinting_result = Some(result);
+    let ctx = make_ctx().with_fingerprinting_result(result);
 
     let prepared = prepare_upstream_request(&ctx, &FingerprintHeaderConfig::default()).expect("ok");
 
@@ -181,8 +179,7 @@ fn invalid_header_names_error_and_do_not_mutate_ctx_request() {
         computed_at,
     );
 
-    let mut ctx = make_ctx();
-    ctx.fingerprinting_result = Some(result);
+    let mut ctx = make_ctx().with_fingerprinting_result(result);
     ctx.request
         .headers
         .insert("Existing".to_string(), "keep".to_string());
@@ -225,8 +222,7 @@ fn existing_headers_are_replaced_in_returned_request() {
         computed_at,
     );
 
-    let mut ctx = make_ctx();
-    ctx.fingerprinting_result = Some(result);
+    let mut ctx = make_ctx().with_fingerprinting_result(result);
     ctx.request
         .headers
         .insert("X-JA4T".to_string(), "old".to_string());

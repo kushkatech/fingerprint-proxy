@@ -47,8 +47,13 @@ systemd.
 ## Dynamic Domain Configuration
 
 The bootstrap configuration is immutable for the lifetime of the process.
-Changing listener mode, bootstrap TLS certificate inventory, stats API bind, or
-system limits requires a process restart.
+Changing listener mode, bootstrap TLS certificate inventory, TLS private-key
+provider settings, stats API bind, or system limits requires a process restart.
+The current TLS private-key provider boundary implements only
+`private_key_provider = { kind = "file", pem_path = "..." }`; `pkcs11`, `kms`,
+and `tpm` are recognized but rejected until real provider-backed signing
+backends are implemented under `T328`. Do not treat those provider kinds as
+production-ready HSM or external key-storage integrations.
 
 Dynamic domain configuration is applied at runtime through snapshot activation.
 New connections use the newly activated snapshot; existing connections continue
@@ -74,7 +79,22 @@ without network and authentication controls.
 
 ## HTTP/3 Status
 
-HTTP/3 over QUIC remains the canonical runtime compliance gap. While `T291` is
-open, negotiated `h3` fails deterministically with the tracked `STUB[T291]`
-behavior. Production deployments that require HTTP/3 should wait for Phase 22
-completion.
+HTTP/3 over QUIC remains a required compliance target and the canonical runtime
+compliance gap. End-to-end HTTP/3 forwarding is still open under `T291`; wait
+for `T291` closure via `T308`-`T310` before treating HTTP/3 as production-ready.
+
+UDP/QUIC listeners are not bound by default. For safe production deployments
+with HTTP/3 disabled, leave bootstrap `enable_http3_quic_listeners = false` and
+keep effective virtual hosts at `allow_http3 = false`; UDP bind failures cannot
+affect HTTP/1 or HTTP/2 startup in that configuration.
+
+The current experimental QUIC boundary requires both bootstrap
+`enable_http3_quic_listeners = true` and at least one effective virtual host
+with `allow_http3 = true`. The one-true/one-false combinations are validation
+errors. `enable_http3_quic_listeners = true` is also rejected with
+`listener_acquisition_mode = "inherited_systemd"` because inherited UDP sockets
+are not supported.
+
+Negotiated `h3` still fails deterministically with the tracked `STUB[T291]`
+behavior. No HTTP/1 or HTTP/2 fallback, downgrade, upgrade, or translation is
+performed.

@@ -94,3 +94,54 @@ protocol = { allow_http1 = true, allow_http2 = false, allow_http3 = false }
     assert_eq!(err.kind, ErrorKind::ValidationFailed);
     assert!(err.message.contains("multiple default virtual hosts"));
 }
+
+#[test]
+fn http2_server_push_policy_defaults_to_suppress() {
+    let path = write_temp(
+        r#"
+version = "v1"
+
+[[virtual_hosts]]
+id = 1
+match_criteria = { sni = [], destination = [] }
+tls = { certificate = { id = "c1" }, cipher_suites = [] }
+upstream = { protocol = "http", host = "a", port = 1 }
+protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false }
+"#,
+        ".toml",
+    );
+
+    let cfg = load_domain_config_from_file(path).expect("load domain config");
+
+    assert_eq!(
+        cfg.virtual_hosts[0].protocol.http2_server_push_policy,
+        fingerprint_proxy_bootstrap_config::config::Http2ServerPushPolicy::Suppress
+    );
+}
+
+#[test]
+fn explicit_http2_server_push_forward_is_validation_failed() {
+    let path = write_temp(
+        r#"
+version = "v1"
+
+[[virtual_hosts]]
+id = 1
+match_criteria = { sni = [], destination = [] }
+tls = { certificate = { id = "c1" }, cipher_suites = [] }
+upstream = { protocol = "http", host = "a", port = 1 }
+protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false, http2_server_push_policy = "forward" }
+"#,
+        ".toml",
+    );
+
+    let err = load_domain_config_from_file(path).expect_err("forward must fail validation");
+
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("domain.virtual_hosts[0].protocol.http2_server_push_policy"));
+    assert!(err
+        .message
+        .contains("HTTP/2 server push forwarding is not supported; use suppress"));
+}

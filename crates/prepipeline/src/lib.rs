@@ -24,11 +24,11 @@ pub struct PrePipelineInput {
 }
 
 pub fn build_request_context(pre: PrePipelineInput) -> FpResult<RequestContext> {
-    let mut ctx = RequestContext::new(pre.id, pre.connection, pre.request);
+    let mut ctx = RequestContext::new(pre.id, pre.connection, pre.request)
+        .with_fingerprinting_result(pre.fingerprinting_result);
     ctx.response = pre.response;
     ctx.virtual_host = pre.virtual_host;
     ctx.module_config = pre.module_config;
     ctx.client_network_rules = pre.client_network_rules;
-    ctx.fingerprinting_result = Some(pre.fingerprinting_result);
     Ok(ctx)
 }

@@ -4,7 +4,7 @@ use fingerprint_proxy_core::error::FpError;
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, PipelineModuleContext};
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::response::set_response_status;
 use fingerprint_proxy_pipeline::Pipeline;
@@ -68,7 +68,7 @@ impl PipelineModule for SetHeaderModule {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         ctx.request.headers.insert("x-mutated".into(), "1".into());
         Ok(ModuleDecision::Continue)
     }
@@ -88,10 +88,9 @@ impl PipelineModule for AssertFingerprintsPresentAtStart {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         let got = ctx
-            .fingerprinting_result
-            .as_ref()
+            .fingerprinting_result()
             .expect("fingerprinting_result must be set before pipeline execution");
         assert_eq!(got, &self.expected);
         Ok(ModuleDecision::Continue)
@@ -111,7 +110,7 @@ impl PipelineModule for StopModule {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 418);
         Ok(ModuleDecision::Terminate)
     }
@@ -130,7 +129,7 @@ impl PipelineModule for ErrorModule {
         self.deps
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Err(FpError::internal("boom"))
     }
 }
@@ -150,7 +149,7 @@ impl PipelineModule for MarkExecutedModule {
         self.deps
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         self.marker.store(true, Ordering::SeqCst);
         Ok(ModuleDecision::Continue)
     }
@@ -238,7 +237,7 @@ fn continue_path_returns_ctx_with_mutations() {
                 ctx.request.headers.get("x-mutated").map(String::as_str),
                 Some("1")
             );
-            assert!(ctx.fingerprinting_result.is_some());
+            assert!(ctx.fingerprinting_result().is_some());
             assert_eq!(trace.len(), 2);
         }
         OrchestrationOutcome::Stopped { .. } => panic!("expected continued"),

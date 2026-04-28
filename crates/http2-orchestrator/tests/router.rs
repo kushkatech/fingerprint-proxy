@@ -4,7 +4,9 @@ use fingerprint_proxy_core::error::FpError;
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{
+    HttpRequest, HttpResponse, PipelineModuleContext, RequestContext,
+};
 use fingerprint_proxy_hpack::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 use fingerprint_proxy_http2::frames::{Frame, FrameHeader, FramePayload, FrameType};
 use fingerprint_proxy_http2::{
@@ -15,7 +17,7 @@ use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::response::set_response_status;
 use fingerprint_proxy_pipeline::Pipeline;
 use fingerprint_proxy_prepipeline::PrePipelineInput;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
 
@@ -139,7 +141,7 @@ impl PipelineModule for TerminateModule {
         "terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, self.status);
         ctx.response.headers = self.headers.clone();
         ctx.response.body = self.body.clone();
@@ -154,7 +156,7 @@ impl PipelineModule for ContinueModule {
         "cont"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Ok(ModuleDecision::Continue)
     }
 }
@@ -166,7 +168,7 @@ impl PipelineModule for ErrorModule {
         "err"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Err(FpError::internal("boom"))
     }
 }
@@ -176,6 +178,7 @@ struct TestDeps<'a> {
     encoder: Encoder,
     pipeline: &'a Pipeline,
     continued_response: HttpResponse,
+    continued: VecDeque<(StreamId, HttpResponse)>,
 }
 
 impl RouterDeps for TestDeps<'_> {
@@ -207,18 +210,14 @@ impl RouterDeps for TestDeps<'_> {
         })
     }
 
-    fn handle_continued<'a>(
-        &'a mut self,
+    fn spawn_continued(
+        &mut self,
+        stream_id: StreamId,
         _ctx: RequestContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = fingerprint_proxy_core::error::FpResult<HttpResponse>>
-                + Send
-                + 'a,
-        >,
-    > {
-        let resp = self.continued_response.clone();
-        Box::pin(async move { Ok(resp) })
+    ) -> fingerprint_proxy_core::error::FpResult<()> {
+        self.continued
+            .push_back((stream_id, self.continued_response.clone()));
+        Ok(())
     }
 }
 
@@ -238,6 +237,7 @@ async fn routes_single_stream_request_to_pipeline_and_emits_response_frames() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: HttpResponse::default(),
+        continued: VecDeque::new(),
     };
 
     let stream_id = StreamId::new(1).unwrap();
@@ -285,6 +285,7 @@ async fn response_with_body_emits_data_frame() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: HttpResponse::default(),
+        continued: VecDeque::new(),
     };
 
     let stream_id = StreamId::new(1).unwrap();
@@ -311,6 +312,7 @@ async fn pipeline_error_is_propagated() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: HttpResponse::default(),
+        continued: VecDeque::new(),
     };
 
     let stream_id = StreamId::new(1).unwrap();
@@ -339,6 +341,7 @@ async fn continued_pipeline_is_forwarded_via_deps_callback() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: continued,
+        continued: VecDeque::new(),
     };
 
     let stream_id = StreamId::new(1).unwrap();
@@ -348,6 +351,12 @@ async fn continued_pipeline_is_forwarded_via_deps_callback() {
         .process_frame(headers_only_request_frame(stream_id), &mut deps)
         .await
         .expect("process");
+    assert!(frames.is_empty());
+    let (completed_stream_id, response) = deps.continued.pop_front().expect("continued response");
+    assert_eq!(completed_stream_id, stream_id);
+    let frames = router
+        .encode_response(completed_stream_id, &response, &mut deps)
+        .expect("encode continued response");
     assert_eq!(frames.len(), 1);
     let FramePayload::Headers(block) = &frames[0].payload else {
         panic!("expected HEADERS payload");
@@ -382,6 +391,7 @@ async fn multi_fragment_request_completes_and_emits_response_frames() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: HttpResponse::default(),
+        continued: VecDeque::new(),
     };
 
     let stream_id = StreamId::new(1).unwrap();
@@ -424,6 +434,7 @@ async fn multi_stream_isolation_interleaving_produces_responses_per_stream() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         continued_response: HttpResponse::default(),
+        continued: VecDeque::new(),
     };
 
     let s1 = StreamId::new(1).unwrap();

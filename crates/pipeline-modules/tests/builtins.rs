@@ -37,7 +37,7 @@ fn make_ctx() -> RequestContext {
         computed_at: Some(SystemTime::UNIX_EPOCH),
         failure_reason: None,
     };
-    ctx.fingerprinting_result = Some(FingerprintComputationResult {
+    ctx = ctx.with_fingerprinting_result(FingerprintComputationResult {
         fingerprints: Fingerprints {
             ja4t: complete(FingerprintKind::Ja4T, "ja4t"),
             ja4: complete(FingerprintKind::Ja4, "ja4"),

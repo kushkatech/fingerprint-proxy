@@ -1,9 +1,10 @@
 use crate::ipv6::{upstream_connect_target, upstream_tls_server_name};
-use crate::ipv6_routing::{connect_tcp_with_routing, AddressFamilyPreference};
+use crate::ipv6_routing::{connect_tcp_with_routing_and_timeout, AddressFamilyPreference};
 use crate::{
     FpError, FpResult, UPSTREAM_TLS_H2_ALPN_MISMATCH_MESSAGE, UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 const ALPN_H2: &[u8] = b"h2";
 
@@ -22,11 +23,25 @@ pub type BoxedUpstreamIo = Box<dyn AsyncReadWrite>;
 #[derive(Clone)]
 pub struct Http2Connector {
     tls_client_config: Arc<rustls::ClientConfig>,
+    connect_timeout: Option<Duration>,
 }
 
 impl Http2Connector {
     pub fn new(tls_client_config: Arc<rustls::ClientConfig>) -> Self {
-        Self { tls_client_config }
+        Self {
+            tls_client_config,
+            connect_timeout: None,
+        }
+    }
+
+    pub fn with_connect_timeout(
+        tls_client_config: Arc<rustls::ClientConfig>,
+        connect_timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            tls_client_config,
+            connect_timeout,
+        }
     }
 
     pub fn with_system_roots() -> Self {
@@ -46,10 +61,11 @@ impl Http2Connector {
         };
 
         upstream_connect_target(upstream_host, upstream_port)?;
-        let tcp = connect_tcp_with_routing(
+        let tcp = connect_tcp_with_routing_and_timeout(
             upstream_host,
             upstream_port,
             AddressFamilyPreference::PreferIpv6,
+            self.connect_timeout,
         )
         .await?;
 

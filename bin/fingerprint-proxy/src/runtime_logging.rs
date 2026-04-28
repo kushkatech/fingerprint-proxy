@@ -28,6 +28,10 @@ pub(crate) fn log_ja4t_saved_syn_capture_failure(
     log_ja4t_saved_syn_capture_failure_with_sink(&CoreRuntimeLogSink, failure_reason, err);
 }
 
+pub(crate) fn log_ja4t_saved_syn_startup_unavailable(err: &FpError) {
+    log_ja4t_saved_syn_startup_unavailable_with_sink(&CoreRuntimeLogSink, err);
+}
+
 pub(crate) fn quic_udp_boundary_error_event(
     timestamp_unix_ms: u64,
     err: &FpError,
@@ -57,6 +61,20 @@ pub(crate) fn ja4t_saved_syn_capture_failure_event(
     .with_context("error", err.to_string())
 }
 
+pub(crate) fn ja4t_saved_syn_startup_unavailable_event(
+    timestamp_unix_ms: u64,
+    err: &FpError,
+) -> StructuredLogEvent {
+    StructuredLogEvent::new(
+        timestamp_unix_ms,
+        LogLevel::Warn,
+        "runtime",
+        "ja4t_saved_syn_startup_unavailable",
+    )
+    .with_context("mode", "allow_unavailable")
+    .with_context("error", err.to_string())
+}
+
 fn log_quic_udp_boundary_error_with_sink(sink: &dyn RuntimeLogSink, err: &FpError) {
     sink.emit(quic_udp_boundary_error_event(
         current_timestamp_unix_ms(),
@@ -72,6 +90,13 @@ fn log_ja4t_saved_syn_capture_failure_with_sink(
     sink.emit(ja4t_saved_syn_capture_failure_event(
         current_timestamp_unix_ms(),
         failure_reason,
+        err,
+    ));
+}
+
+fn log_ja4t_saved_syn_startup_unavailable_with_sink(sink: &dyn RuntimeLogSink, err: &FpError) {
+    sink.emit(ja4t_saved_syn_startup_unavailable_event(
+        current_timestamp_unix_ms(),
         err,
     ));
 }
@@ -126,6 +151,17 @@ mod tests {
         assert_eq!(
             format_structured_log_event(&event),
             "ts=1710001234567 level=WARN component=runtime message=ja4t_saved_syn_capture_failed context={category=ParsingError,error=InvalidProtocolData: malformed saved SYN}"
+        );
+    }
+
+    #[test]
+    fn ja4t_saved_syn_startup_unavailable_log_event_identifies_degraded_mode() {
+        let err = FpError::internal("failed to enable TCP_SAVE_SYN on runtime listener");
+        let event = ja4t_saved_syn_startup_unavailable_event(1710001234567, &err);
+
+        assert_eq!(
+            format_structured_log_event(&event),
+            "ts=1710001234567 level=WARN component=runtime message=ja4t_saved_syn_startup_unavailable context={error=Internal: failed to enable TCP_SAVE_SYN on runtime listener,mode=allow_unavailable}"
         );
     }
 

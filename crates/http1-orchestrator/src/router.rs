@@ -1,4 +1,5 @@
 use fingerprint_proxy_core::error::{FpError, FpResult};
+use fingerprint_proxy_core::http_date::current_http_date;
 use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
 use fingerprint_proxy_pipeline::Pipeline;
 use fingerprint_proxy_prepipeline::{
@@ -7,7 +8,9 @@ use fingerprint_proxy_prepipeline::{
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::message_assembler::{AssemblerEvent, AssemblerInput, Http1MessageAssembler, Limits};
+use crate::message_assembler::{
+    AssemblerEvent, AssemblerInput, ClientRequestError, Http1MessageAssembler, Limits,
+};
 
 pub trait Http1RouterDeps: Send + Sync {
     fn pipeline(&self) -> &Pipeline;
@@ -27,6 +30,7 @@ pub struct PendingWebSocketUpgrade {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http1ProcessOutput {
     Responses(Vec<Vec<u8>>),
+    CloseAfterResponses(Vec<Vec<u8>>),
     WebSocketUpgrade(Box<PendingWebSocketUpgrade>),
 }
 
@@ -89,6 +93,10 @@ impl Http1ConnectionRouter {
                         Err(e) => return Err(e),
                     }
                 }
+                AssemblerEvent::ClientError(e) => {
+                    out.push(serialize_http1_client_error_response(&e)?);
+                    return Ok(Http1ProcessOutput::CloseAfterResponses(out));
+                }
                 AssemblerEvent::Error(e) => return Err(e),
             }
         }
@@ -140,6 +148,24 @@ fn serialize_http1_router_response(
     out.extend_from_slice(b"\r\n");
 
     Ok(out)
+}
+
+fn serialize_http1_client_error_response(error: &ClientRequestError) -> FpResult<Vec<u8>> {
+    let mut response = HttpResponse {
+        version: "HTTP/1.1".to_string(),
+        status: Some(error.status.status_code()),
+        ..HttpResponse::default()
+    };
+    response
+        .headers
+        .insert("Content-Length".to_string(), "0".to_string());
+    response
+        .headers
+        .insert("Date".to_string(), current_http_date());
+    response
+        .headers
+        .insert("Connection".to_string(), "close".to_string());
+    serialize_http1_router_response(&response)
 }
 
 fn validate_http1_trailer_map(

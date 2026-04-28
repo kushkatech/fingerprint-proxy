@@ -31,6 +31,6 @@ id = 1
 match_criteria = { sni = [{ kind = "exact", value = "example.com" }], destination = [] }
 tls = { certificate = { id = "default" }, minimum_tls_version = "tls13", cipher_suites = [] }
 upstream = { protocol = "https", allowed_upstream_app_protocols = ["http1", "http2"], host = "backend.example.internal", port = 443 }
-protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false }
+protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false, http2_server_push_policy = "suppress" }
 
 [virtual_hosts.module_config]

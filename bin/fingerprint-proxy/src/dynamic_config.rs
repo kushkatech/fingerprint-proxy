@@ -1,11 +1,12 @@
-use crate::runtime::RuntimeTlsServerConfigs;
+use crate::runtime::{
+    PreparedRuntimeTlsServerConfigs, RuntimeTlsMaterial, RuntimeTlsServerConfigs,
+};
 use fingerprint_proxy_bootstrap_config::certificates::load_tls_certificates;
 use fingerprint_proxy_bootstrap_config::config::{
     BootstrapConfig, DomainConfig, DynamicConfigProviderSettings,
 };
 use fingerprint_proxy_bootstrap_config::dynamic::atomic_update::{
-    prepare_candidate_snapshot, ActiveSnapshotStore, CandidateSnapshot, DynamicConfigSnapshot,
-    SnapshotActivation,
+    prepare_candidate_snapshot, CandidateSnapshot, DynamicConfigSnapshot,
 };
 use fingerprint_proxy_bootstrap_config::dynamic::cert_validation::validate_candidate_certificate_references;
 use fingerprint_proxy_bootstrap_config::dynamic::logging::{
@@ -23,6 +24,7 @@ use fingerprint_proxy_bootstrap_config::dynamic::validation::validate_candidate_
 use fingerprint_proxy_bootstrap_config::dynamic::version_check::{
     detect_revision_change_from_configs, RevisionChange,
 };
+use fingerprint_proxy_bootstrap_config::validation::validate_http3_quic_listener_policy;
 use fingerprint_proxy_bootstrap_config::version_retrieval::VersionedConfig;
 use fingerprint_proxy_bootstrap_config::versioning::{ConfigRevisionId, ConfigVersionSelector};
 use fingerprint_proxy_core::error::{FpError, FpResult};
@@ -33,9 +35,83 @@ use tokio::sync::watch;
 
 const DEFAULT_UPSTREAM_CHECK_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeDynamicConfigSnapshot {
+    domain: Arc<DynamicConfigSnapshot>,
+    tls_material: Arc<RuntimeTlsMaterial>,
+}
+
+impl RuntimeDynamicConfigSnapshot {
+    pub(crate) fn new(
+        domain: Arc<DynamicConfigSnapshot>,
+        tls_material: Arc<RuntimeTlsMaterial>,
+    ) -> Self {
+        Self {
+            domain,
+            tls_material,
+        }
+    }
+
+    pub(crate) fn revision_id(&self) -> &ConfigRevisionId {
+        self.domain.revision_id()
+    }
+
+    pub(crate) fn config(&self) -> &DomainConfig {
+        self.domain.config()
+    }
+
+    pub(crate) fn tls_material(&self) -> Arc<RuntimeTlsMaterial> {
+        Arc::clone(&self.tls_material)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeSnapshotActivation {
+    pub previous_active: Arc<RuntimeDynamicConfigSnapshot>,
+    pub active: Arc<RuntimeDynamicConfigSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveRuntimeSnapshotStore {
+    active: Arc<RwLock<Arc<RuntimeDynamicConfigSnapshot>>>,
+}
+
+impl ActiveRuntimeSnapshotStore {
+    fn new(initial_active: RuntimeDynamicConfigSnapshot) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(Arc::new(initial_active))),
+        }
+    }
+
+    fn active_snapshot(&self) -> FpResult<Arc<RuntimeDynamicConfigSnapshot>> {
+        let guard = self
+            .active
+            .read()
+            .map_err(|_| lock_poisoned_error("read"))?;
+        Ok(Arc::clone(&guard))
+    }
+
+    fn activate(
+        &self,
+        active: RuntimeDynamicConfigSnapshot,
+    ) -> FpResult<RuntimeSnapshotActivation> {
+        let mut guard = self
+            .active
+            .write()
+            .map_err(|_| lock_poisoned_error("write"))?;
+        let previous_active = Arc::clone(&guard);
+        let active = Arc::new(active);
+        *guard = Arc::clone(&active);
+        Ok(RuntimeSnapshotActivation {
+            previous_active,
+            active,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SharedDynamicConfigState {
-    store: Arc<RwLock<Option<Arc<ActiveSnapshotStore>>>>,
+    store: Arc<RwLock<Option<Arc<ActiveRuntimeSnapshotStore>>>>,
 }
 
 impl SharedDynamicConfigState {
@@ -43,15 +119,43 @@ impl SharedDynamicConfigState {
         Self::default()
     }
 
-    pub fn active_snapshot(&self) -> FpResult<Arc<DynamicConfigSnapshot>> {
+    pub(crate) fn active_snapshot(&self) -> FpResult<Arc<RuntimeDynamicConfigSnapshot>> {
         self.get_or_init_store()?.active_snapshot()
     }
 
-    pub fn activate(&self, candidate: CandidateSnapshot) -> FpResult<SnapshotActivation> {
-        self.get_or_init_store()?.activate(candidate)
+    pub(crate) fn initialize(
+        &self,
+        initial_domain: DomainConfig,
+        initial_tls_material: Arc<RuntimeTlsMaterial>,
+    ) -> FpResult<()> {
+        let snapshot = RuntimeDynamicConfigSnapshot::new(
+            Arc::new(DynamicConfigSnapshot::from_domain_config(initial_domain)),
+            initial_tls_material,
+        );
+        let mut guard = self
+            .store
+            .write()
+            .map_err(|_| lock_poisoned_error("write"))?;
+        *guard = Some(Arc::new(ActiveRuntimeSnapshotStore::new(snapshot)));
+        Ok(())
     }
 
-    fn get_or_init_store(&self) -> FpResult<Arc<ActiveSnapshotStore>> {
+    pub(crate) fn is_initialized(&self) -> FpResult<bool> {
+        let guard = self.store.read().map_err(|_| lock_poisoned_error("read"))?;
+        Ok(guard.is_some())
+    }
+
+    pub(crate) fn activate(
+        &self,
+        candidate: CandidateSnapshot,
+        prepared_tls: PreparedRuntimeTlsServerConfigs,
+    ) -> FpResult<RuntimeSnapshotActivation> {
+        let snapshot =
+            RuntimeDynamicConfigSnapshot::new(candidate.snapshot(), prepared_tls.into_material());
+        self.get_or_init_store()?.activate(snapshot)
+    }
+
+    fn get_or_init_store(&self) -> FpResult<Arc<ActiveRuntimeSnapshotStore>> {
         {
             let guard = self.store.read().map_err(|_| lock_poisoned_error("read"))?;
             if let Some(existing) = guard.as_ref() {
@@ -59,17 +163,9 @@ impl SharedDynamicConfigState {
             }
         }
 
-        let initial_domain =
-            fingerprint_proxy_bootstrap_config::domain_provider::load_domain_config()?;
-        let initial_snapshot = DynamicConfigSnapshot::from_domain_config(initial_domain);
-        let created = Arc::new(ActiveSnapshotStore::new(initial_snapshot));
-
-        let mut guard = self
-            .store
-            .write()
-            .map_err(|_| lock_poisoned_error("write"))?;
-        let store = guard.get_or_insert_with(|| Arc::clone(&created));
-        Ok(Arc::clone(store))
+        Err(FpError::internal(
+            "runtime dynamic configuration snapshot is not initialized",
+        ))
     }
 
     #[cfg(test)]
@@ -77,12 +173,27 @@ impl SharedDynamicConfigState {
         &self,
         domain_config: DomainConfig,
     ) -> FpResult<()> {
-        let snapshot = DynamicConfigSnapshot::from_domain_config(domain_config);
+        self.replace_active_runtime_snapshot_for_tests(
+            domain_config,
+            RuntimeTlsServerConfigs::test_material(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_active_runtime_snapshot_for_tests(
+        &self,
+        domain_config: DomainConfig,
+        tls_material: Arc<RuntimeTlsMaterial>,
+    ) -> FpResult<()> {
+        let snapshot = RuntimeDynamicConfigSnapshot::new(
+            Arc::new(DynamicConfigSnapshot::from_domain_config(domain_config)),
+            tls_material,
+        );
         let mut guard = self
             .store
             .write()
             .map_err(|_| lock_poisoned_error("write"))?;
-        *guard = Some(Arc::new(ActiveSnapshotStore::new(snapshot)));
+        *guard = Some(Arc::new(ActiveRuntimeSnapshotStore::new(snapshot)));
         Ok(())
     }
 }
@@ -314,6 +425,23 @@ impl DynamicConfigUpdater {
                 return;
             }
         };
+        let http3_policy_report = validate_http3_quic_listener_policy(
+            &self.bootstrap_config,
+            validated_candidate.config(),
+        );
+        if http3_policy_report.has_errors() {
+            let err = FpError::validation_failed(format!(
+                "dynamic domain config candidate HTTP/3 QUIC listener policy validation failed:\n{http3_policy_report}"
+            ));
+            self.log_failure(
+                at_unix,
+                UpdateOperation::Validation,
+                active_revision.clone(),
+                candidate_revision.clone(),
+                &err,
+            );
+            return;
+        }
 
         let reloaded_tls_certs = match load_tls_certificates(&self.bootstrap_config) {
             Ok(loaded) => loaded,
@@ -414,41 +542,12 @@ impl DynamicConfigUpdater {
             .with_candidate_revision(candidate_revision.clone()),
         );
 
-        let tls_activation = match self.tls_server_configs.apply_prepared(prepared_tls_configs) {
+        let activation = match self.state.activate(
+            prepare_candidate_snapshot(validated_candidate),
+            prepared_tls_configs,
+        ) {
             Ok(activation) => activation,
             Err(err) => {
-                self.log_failure(
-                    at_unix,
-                    UpdateOperation::Activation,
-                    active_revision.clone(),
-                    candidate_revision.clone(),
-                    &err,
-                );
-                return;
-            }
-        };
-
-        let activation = match self
-            .state
-            .activate(prepare_candidate_snapshot(validated_candidate))
-        {
-            Ok(activation) => activation,
-            Err(err) => {
-                if let Err(rollback_err) = self.tls_server_configs.restore_previous(tls_activation)
-                {
-                    self.log_event(
-                        UpdateLogEvent::new(
-                            UpdateOperation::Activation,
-                            UpdateOutcome::Failed,
-                            format!(
-                                "TLS material rollback failed after domain activation failure: kind={:?} message={}",
-                                rollback_err.kind, rollback_err.message
-                            ),
-                        )
-                        .with_active_revision(active_revision.clone())
-                        .with_candidate_revision(candidate_revision.clone()),
-                    );
-                }
                 self.log_failure(
                     at_unix,
                     UpdateOperation::Activation,
@@ -535,8 +634,9 @@ mod tests {
     use fingerprint_proxy_bootstrap_config::config::{
         BootstrapConfig, CertificateRef,
         DefaultCertificatePolicy as BootstrapDefaultCertificatePolicy, FingerprintHeaderConfig,
-        ListenerAcquisitionMode, ListenerConfig, ServerNamePattern, StatsApiAuthPolicy,
-        StatsApiConfig, StatsApiNetworkPolicy, SystemLimits, SystemTimeouts, TlsCertificateConfig,
+        Http2ServerPushPolicy, ListenerAcquisitionMode, ListenerConfig, ServerNamePattern,
+        StatsApiAuthPolicy, StatsApiConfig, StatsApiNetworkPolicy, SystemLimits, SystemTimeouts,
+        TlsCertificateConfig, TlsPrivateKeyFileProviderConfig, TlsPrivateKeyProviderConfig,
         UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
         VirtualHostProtocolConfig, VirtualHostTlsConfig, DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
     };
@@ -546,6 +646,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    fn file_private_key_provider(path: impl Into<String>) -> TlsPrivateKeyProviderConfig {
+        TlsPrivateKeyProviderConfig::File(TlsPrivateKeyFileProviderConfig {
+            pem_path: path.into(),
+        })
+    }
 
     fn domain_config(version: &str) -> DomainConfig {
         DomainConfig {
@@ -588,6 +694,7 @@ mod tests {
                     allow_http1: true,
                     allow_http2: true,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             }],
@@ -635,13 +742,18 @@ mod tests {
 
             let bootstrap = BootstrapConfig {
                 listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+                enable_http3_quic_listeners: false,
+                fingerprinting:
+                    fingerprint_proxy_bootstrap_config::config::FingerprintingConfig::default(),
                 listeners: vec![ListenerConfig {
                     bind: "127.0.0.1:0".parse().expect("bind"),
                 }],
                 tls_certificates: vec![TlsCertificateConfig {
                     id: cert_id.to_string(),
                     certificate_pem_path: cert_path.to_string_lossy().to_string(),
-                    private_key_pem_path: key_path.to_string_lossy().to_string(),
+                    private_key_provider: file_private_key_provider(
+                        key_path.to_string_lossy().to_string(),
+                    ),
                     server_names: vec![ServerNamePattern::Exact("dynamic.example.com".to_string())],
                 }],
                 default_certificate_policy: BootstrapDefaultCertificatePolicy::UseDefault(
@@ -696,6 +808,32 @@ mod tests {
                 .active_certificate_der_for_test(cert_id)
                 .expect("active cert")
         }
+
+        fn current_material(&self) -> Arc<RuntimeTlsMaterial> {
+            self.tls_server_configs.current_material()
+        }
+    }
+
+    fn active_snapshot_cert_der(
+        state: &SharedDynamicConfigState,
+        cert_id: &str,
+    ) -> rustls::pki_types::CertificateDer<'static> {
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        RuntimeTlsServerConfigs::certificate_der_from_material_for_test(
+            snapshot.tls_material(),
+            cert_id,
+        )
+        .expect("active snapshot cert")
+    }
+
+    fn seed_state_with_tls(
+        state: &SharedDynamicConfigState,
+        domain_config: DomainConfig,
+        tls: &TestTlsMaterial,
+    ) {
+        state
+            .replace_active_runtime_snapshot_for_tests(domain_config, tls.current_material())
+            .expect("seed state");
     }
 
     struct StaticRetriever {
@@ -971,10 +1109,11 @@ mod tests {
 
     #[test]
     fn apply_once_validation_failure_preserves_prior_active_snapshot() {
+        let cert_id = "cert-a";
+        let tls = TestTlsMaterial::generate(cert_id);
+        let old_cert = tls.active_cert_der(cert_id);
         let state = SharedDynamicConfigState::new();
-        state
-            .replace_active_domain_config_for_tests(domain_config("rev-1"))
-            .expect("seed state");
+        seed_state_with_tls(&state, domain_config("rev-1"), &tls);
         let logger = Arc::new(RecordingLogger::default());
         let stats = Arc::new(RuntimeStatsRegistry::new());
         let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
@@ -986,6 +1125,8 @@ mod tests {
 
         let snapshot = state.active_snapshot().expect("active snapshot");
         assert_eq!(snapshot.revision_id().as_str(), "rev-1");
+        let active_cert = active_snapshot_cert_der(&state, cert_id);
+        assert_eq!(active_cert.as_ref(), old_cert.as_ref());
 
         let counters = stats.snapshot(&EffectiveTimeWindow {
             from: 99,
@@ -1004,6 +1145,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_once_http3_quic_listener_policy_failure_preserves_prior_active_snapshot() {
+        let state = SharedDynamicConfigState::new();
+        state
+            .replace_active_domain_config_for_tests(domain_config("rev-1"))
+            .expect("seed state");
+        let logger = Arc::new(RecordingLogger::default());
+        let stats = Arc::new(RuntimeStatsRegistry::new());
+        let mut candidate = domain_config_with_upstream("rev-2", "cert-a");
+        candidate.virtual_hosts[0].protocol.allow_http3 = true;
+        let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(candidate))));
+        let updater = test_updater(state.clone(), retriever, logger.clone(), Arc::clone(&stats));
+
+        updater.apply_once(101);
+
+        let snapshot = state.active_snapshot().expect("active snapshot");
+        assert_eq!(snapshot.revision_id().as_str(), "rev-1");
+
+        let counters = stats.snapshot(&EffectiveTimeWindow {
+            from: 101,
+            to: 101,
+            window_seconds: 1,
+        });
+        assert_eq!(counters.system.configuration_updates, 0);
+        assert_eq!(counters.system.configuration_update_failures, 1);
+
+        let events = logger.events();
+        assert!(events.iter().any(|event| {
+            event.operation == UpdateOperation::Validation
+                && event.outcome == UpdateOutcome::Failed
+                && event.detail.contains(
+                    "dynamic domain config candidate HTTP/3 QUIC listener policy validation failed",
+                )
+                && event.detail.contains(
+                    "one or more virtual hosts allow HTTP/3 but bootstrap HTTP/3 QUIC listeners are disabled",
+                )
+        }));
+    }
+
+    #[test]
     fn apply_once_invalid_rotated_certificate_blocks_activation_and_preserves_tls_material() {
         let cert_id = "cert-a";
         let tls = TestTlsMaterial::generate(cert_id);
@@ -1011,9 +1191,7 @@ mod tests {
         tls.rotate_invalid_leaf();
 
         let state = SharedDynamicConfigState::new();
-        state
-            .replace_active_domain_config_for_tests(domain_config("rev-1"))
-            .expect("seed state");
+        seed_state_with_tls(&state, domain_config("rev-1"), &tls);
         let logger = Arc::new(RecordingLogger::default());
         let stats = Arc::new(RuntimeStatsRegistry::new());
         let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
@@ -1033,7 +1211,7 @@ mod tests {
 
         let snapshot = state.active_snapshot().expect("active snapshot");
         assert_eq!(snapshot.revision_id().as_str(), "rev-1");
-        let active_cert = tls.active_cert_der(cert_id);
+        let active_cert = active_snapshot_cert_der(&state, cert_id);
         assert_eq!(active_cert.as_ref(), old_cert.as_ref());
 
         let counters = stats.snapshot(&EffectiveTimeWindow {
@@ -1060,9 +1238,7 @@ mod tests {
         tls.rotate_valid_leaf();
 
         let state = SharedDynamicConfigState::new();
-        state
-            .replace_active_domain_config_for_tests(domain_config("rev-1"))
-            .expect("seed state");
+        seed_state_with_tls(&state, domain_config("rev-1"), &tls);
         let logger = Arc::new(RecordingLogger::default());
         let stats = Arc::new(RuntimeStatsRegistry::new());
         let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
@@ -1082,7 +1258,7 @@ mod tests {
 
         let snapshot = state.active_snapshot().expect("active snapshot");
         assert_eq!(snapshot.revision_id().as_str(), "rev-1");
-        let active_cert = tls.active_cert_der(cert_id);
+        let active_cert = active_snapshot_cert_der(&state, cert_id);
         assert_eq!(active_cert.as_ref(), old_cert.as_ref());
 
         let counters = stats.snapshot(&EffectiveTimeWindow {
@@ -1111,9 +1287,7 @@ mod tests {
         tls.rotate_valid_leaf();
 
         let state = SharedDynamicConfigState::new();
-        state
-            .replace_active_domain_config_for_tests(domain_config("rev-1"))
-            .expect("seed state");
+        seed_state_with_tls(&state, domain_config("rev-1"), &tls);
         let logger = Arc::new(RecordingLogger::default());
         let stats = Arc::new(RuntimeStatsRegistry::new());
         let retriever = Arc::new(StaticRetriever::new(Ok(VersionedConfig::Found(
@@ -1133,7 +1307,7 @@ mod tests {
 
         let snapshot = state.active_snapshot().expect("active snapshot");
         assert_eq!(snapshot.revision_id().as_str(), "rev-2");
-        let active_cert = tls.active_cert_der(cert_id);
+        let active_cert = active_snapshot_cert_der(&state, cert_id);
         assert_ne!(active_cert.as_ref(), old_cert.as_ref());
 
         let counters = stats.snapshot(&EffectiveTimeWindow {

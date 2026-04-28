@@ -1,6 +1,6 @@
-use fingerprint_proxy_core::request::RequestContext;
+use fingerprint_proxy_core::request::{PipelineModuleContext, RequestContext};
 
-pub fn set_response_status(ctx: &mut RequestContext, status: u16) {
+pub fn set_response_status(ctx: &mut PipelineModuleContext<'_>, status: u16) {
     ctx.response.status = Some(status);
 }
 

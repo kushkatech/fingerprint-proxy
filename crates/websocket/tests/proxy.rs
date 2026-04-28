@@ -1,6 +1,7 @@
 use fingerprint_proxy_core::error::ErrorKind;
 use fingerprint_proxy_websocket::{
-    WebSocketOpcode, WebSocketProxyDirection, WebSocketProxyState, WebSocketProxyTerminalState,
+    WebSocketOpcode, WebSocketProxyDirection, WebSocketProxyLimits, WebSocketProxyState,
+    WebSocketProxyTerminalState,
 };
 
 #[test]
@@ -15,6 +16,58 @@ fn proxy_state_buffers_partial_client_frame_until_complete() {
     let progress = state.push_bytes(&frame[2..]).expect("frame completes");
     assert_eq!(progress.bytes_to_forward, frame);
     assert_eq!(progress.terminal_state, WebSocketProxyTerminalState::Open);
+}
+
+#[test]
+fn proxy_state_forwards_frame_within_configured_payload_limit() {
+    let frame = masked_frame(WebSocketOpcode::Text, b"ok");
+    let mut state = WebSocketProxyState::new_with_limits(
+        WebSocketProxyDirection::ClientToUpstream,
+        WebSocketProxyLimits {
+            max_frame_payload_bytes: 2,
+        },
+    );
+
+    let progress = state
+        .push_bytes(&frame)
+        .expect("frame at limit is accepted");
+    assert_eq!(progress.bytes_to_forward, frame);
+    assert_eq!(progress.terminal_state, WebSocketProxyTerminalState::Open);
+}
+
+#[test]
+fn proxy_state_rejects_complete_frame_over_configured_payload_limit() {
+    let frame = masked_frame(WebSocketOpcode::Text, b"bad");
+    let mut state = WebSocketProxyState::new_with_limits(
+        WebSocketProxyDirection::ClientToUpstream,
+        WebSocketProxyLimits {
+            max_frame_payload_bytes: 2,
+        },
+    );
+
+    let error = state
+        .push_bytes(&frame)
+        .expect_err("oversized complete frame is rejected");
+    assert_eq!(error.kind, ErrorKind::InvalidProtocolData);
+    assert!(error.message.contains("exceeds configured maximum 2"));
+}
+
+#[test]
+fn proxy_state_rejects_partial_frame_over_limit_before_full_frame_exists() {
+    let frame = masked_frame(WebSocketOpcode::Text, b"oversize");
+    let incomplete = &frame[..frame.len() - 1];
+    let mut state = WebSocketProxyState::new_with_limits(
+        WebSocketProxyDirection::ClientToUpstream,
+        WebSocketProxyLimits {
+            max_frame_payload_bytes: 5,
+        },
+    );
+
+    let error = state
+        .push_bytes(incomplete)
+        .expect_err("oversized partial frame is rejected");
+    assert_eq!(error.kind, ErrorKind::InvalidProtocolData);
+    assert!(error.message.contains("exceeds configured maximum 5"));
 }
 
 #[test]

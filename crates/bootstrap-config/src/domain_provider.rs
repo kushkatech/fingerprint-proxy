@@ -165,6 +165,16 @@ struct VirtualHostProtocolFile {
     allow_http1: bool,
     allow_http2: bool,
     allow_http3: bool,
+    #[serde(default)]
+    http2_server_push_policy: Http2ServerPushPolicyFile,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum Http2ServerPushPolicyFile {
+    #[default]
+    Suppress,
+    Forward,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -276,6 +286,10 @@ fn map_virtual_host(v: VirtualHostFile) -> FpResult<VirtualHostConfig> {
             allow_http1: v.protocol.allow_http1,
             allow_http2: v.protocol.allow_http2,
             allow_http3: v.protocol.allow_http3,
+            http2_server_push_policy: match v.protocol.http2_server_push_policy {
+                Http2ServerPushPolicyFile::Suppress => Http2ServerPushPolicy::Suppress,
+                Http2ServerPushPolicyFile::Forward => Http2ServerPushPolicy::Forward,
+            },
         },
         module_config: v.module_config,
     })

@@ -4,7 +4,9 @@ use fingerprint_proxy_core::error::FpResult;
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{
+    HttpRequest, HttpResponse, PipelineModuleContext, RequestContext,
+};
 use fingerprint_proxy_grpc::parse_grpc_frames;
 use fingerprint_proxy_hpack::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 use fingerprint_proxy_http2::frames::{Frame, FrameHeader, FramePayload, FrameType};
@@ -16,7 +18,7 @@ use fingerprint_proxy_http2_orchestrator::{Http2ConnectionRouter, RouterDeps};
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::Pipeline;
 use fingerprint_proxy_prepipeline::PrePipelineInput;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
 
@@ -73,7 +75,7 @@ impl PipelineModule for ContinueModule {
         "continue"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Ok(ModuleDecision::Continue)
     }
 }
@@ -83,6 +85,7 @@ struct TestDeps<'a> {
     encoder: Encoder,
     pipeline: &'a Pipeline,
     seen_request: Option<HttpRequest>,
+    continued: VecDeque<(StreamId, HttpResponse)>,
 }
 
 impl RouterDeps for TestDeps<'_> {
@@ -111,35 +114,25 @@ impl RouterDeps for TestDeps<'_> {
         })
     }
 
-    fn handle_continued<'a>(
-        &'a mut self,
-        ctx: RequestContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = fingerprint_proxy_core::error::FpResult<HttpResponse>>
-                + Send
-                + 'a,
-        >,
-    > {
+    fn spawn_continued(&mut self, stream_id: StreamId, ctx: RequestContext) -> FpResult<()> {
         self.seen_request = Some(ctx.request.clone());
-        Box::pin(async move {
-            let mut response = HttpResponse {
-                version: "HTTP/2".to_string(),
-                status: Some(200),
-                ..HttpResponse::default()
-            };
-            response
-                .headers
-                .insert("content-type".to_string(), "application/grpc".to_string());
-            response
-                .headers
-                .insert("grpc-encoding".to_string(), "identity".to_string());
-            response.body = grpc_frame(b"pong");
-            response
-                .trailers
-                .insert("grpc-status".to_string(), "0".to_string());
-            Ok(response)
-        })
+        let mut response = HttpResponse {
+            version: "HTTP/2".to_string(),
+            status: Some(200),
+            ..HttpResponse::default()
+        };
+        response
+            .headers
+            .insert("content-type".to_string(), "application/grpc".to_string());
+        response
+            .headers
+            .insert("grpc-encoding".to_string(), "identity".to_string());
+        response.body = grpc_frame(b"pong");
+        response
+            .trailers
+            .insert("grpc-status".to_string(), "0".to_string());
+        self.continued.push_back((stream_id, response));
+        Ok(())
     }
 }
 
@@ -177,6 +170,7 @@ async fn grpc_over_http2_is_forwarded_transparently_through_router() {
         encoder: new_encoder(),
         pipeline: &pipeline,
         seen_request: None,
+        continued: VecDeque::new(),
     };
 
     let request_body = grpc_frame(b"ping");
@@ -230,16 +224,27 @@ async fn grpc_over_http2_is_forwarded_transparently_through_router() {
             .expect("headers"),
         Some(StreamEvent::RequestHeadersReady(_))
     ));
-    assert!(assembler
+    assert!(matches!(
+        assembler
         .push_frame(&mut deps.decoder, data_frame)
         .expect("data")
-        .is_none());
+            .expect("data event"),
+        StreamEvent::RequestBodyData {
+            bytes,
+            end_stream: false,
+            request_complete: None,
+        } if bytes == request_body
+    ));
     let completed = assembler
         .push_frame(&mut deps.decoder, trailers_frame)
         .expect("trailers")
         .expect("complete event");
 
-    let StreamEvent::RequestComplete(request) = completed else {
+    let StreamEvent::RequestTrailersReady {
+        request_complete: request,
+        ..
+    } = completed
+    else {
         panic!("expected complete request");
     };
     assert_eq!(request.body, request_body);
@@ -296,9 +301,16 @@ async fn grpc_over_http2_is_forwarded_transparently_through_router() {
         );
     }
 
-    let seen_request = deps.seen_request.expect("continued request");
+    let seen_request = deps.seen_request.as_ref().expect("continued request");
     assert_eq!(seen_request.version, "HTTP/2");
     assert_eq!(seen_request.body, request_body);
+
+    let (stream_id, response) = deps.continued.pop_front().expect("continued response");
+    emitted.extend(
+        router
+            .encode_response(stream_id, &response, &mut deps)
+            .expect("encode continued response"),
+    );
 
     assert_eq!(emitted.len(), 3);
     let FramePayload::Headers(headers_block) = &emitted[0].payload else {

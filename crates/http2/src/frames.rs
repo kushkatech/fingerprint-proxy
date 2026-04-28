@@ -3,6 +3,8 @@ use crate::settings::Settings;
 use crate::streams::StreamId;
 use std::fmt;
 
+pub const FLAG_PUSH_PROMISE_PADDED: u8 = 0x8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
     Data,
@@ -124,6 +126,11 @@ pub enum Http2FrameError {
         actual: usize,
     },
     ReservedBitSetInWindowUpdate,
+    InvalidPushPromisePayloadLength {
+        actual: usize,
+    },
+    ReservedBitSetInPushPromisePromisedStreamId,
+    InvalidPushPromisePromisedStreamId,
     InvalidDataPadding {
         pad_length: u8,
         payload_length: usize,
@@ -177,6 +184,16 @@ impl fmt::Display for Http2FrameError {
             }
             Http2FrameError::ReservedBitSetInWindowUpdate => {
                 f.write_str("reserved bit set in WINDOW_UPDATE increment")
+            }
+            Http2FrameError::InvalidPushPromisePayloadLength { actual } => write!(
+                f,
+                "PUSH_PROMISE payload length must include promised stream id, got {actual}"
+            ),
+            Http2FrameError::ReservedBitSetInPushPromisePromisedStreamId => {
+                f.write_str("reserved bit set in PUSH_PROMISE promised stream id")
+            }
+            Http2FrameError::InvalidPushPromisePromisedStreamId => {
+                f.write_str("PUSH_PROMISE promised stream id must be non-zero")
             }
             Http2FrameError::InvalidDataPadding {
                 pad_length,
@@ -278,6 +295,41 @@ pub fn serialize_frame(frame: &Frame) -> Result<Vec<u8>, Http2FrameError> {
     out.extend_from_slice(&serialize_frame_header(&frame.header)?);
     out.extend_from_slice(&payload_bytes);
     Ok(out)
+}
+
+pub fn parse_push_promise_promised_stream_id(
+    flags: u8,
+    payload: &[u8],
+) -> Result<StreamId, Http2FrameError> {
+    let promised_id_offset = if (flags & FLAG_PUSH_PROMISE_PADDED) != 0 {
+        if payload.len() < 5 {
+            return Err(Http2FrameError::InvalidPushPromisePayloadLength {
+                actual: payload.len(),
+            });
+        }
+        1
+    } else {
+        if payload.len() < 4 {
+            return Err(Http2FrameError::InvalidPushPromisePayloadLength {
+                actual: payload.len(),
+            });
+        }
+        0
+    };
+    let raw = u32::from_be_bytes([
+        payload[promised_id_offset],
+        payload[promised_id_offset + 1],
+        payload[promised_id_offset + 2],
+        payload[promised_id_offset + 3],
+    ]);
+    if (raw & 0x8000_0000) != 0 {
+        return Err(Http2FrameError::ReservedBitSetInPushPromisePromisedStreamId);
+    }
+    let promised_stream_id = StreamId(raw);
+    if promised_stream_id.is_connection() {
+        return Err(Http2FrameError::InvalidPushPromisePromisedStreamId);
+    }
+    Ok(promised_stream_id)
 }
 
 fn validate_flags_payload_consistency(frame: &Frame) -> Result<(), Http2FrameError> {

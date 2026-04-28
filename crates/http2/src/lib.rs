@@ -29,8 +29,9 @@ pub use conversion::{
 pub use data::{parse_data_payload, serialize_data_payload, FLAG_END_STREAM, FLAG_PADDED};
 pub use flow_control::{FlowControlError, FlowController, DEFAULT_WINDOW_SIZE, MAX_WINDOW_SIZE};
 pub use frames::{
-    parse_frame, parse_frame_header, serialize_frame, serialize_frame_header, Frame, FrameHeader,
-    FramePayload, FrameType, Http2FrameError,
+    parse_frame, parse_frame_header, parse_push_promise_promised_stream_id, serialize_frame,
+    serialize_frame_header, Frame, FrameHeader, FramePayload, FrameType, Http2FrameError,
+    FLAG_PUSH_PROMISE_PADDED,
 };
 pub use grpc_integration::{
     finalize_grpc_http2_response, grpc_http2_request_requires_transparent_forwarding,

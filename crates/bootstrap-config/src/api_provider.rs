@@ -33,7 +33,7 @@ impl ConfigProvider for ApiConfigProvider {
                 "api config provider is unconfigured: missing API endpoint settings",
             )),
             Some(_) => Err(FpError::invalid_configuration(
-                "api config provider skeleton is unimplemented",
+                "api config provider is unsupported in this build; active runtime dynamic configuration supports only file providers",
             )),
         }
     }

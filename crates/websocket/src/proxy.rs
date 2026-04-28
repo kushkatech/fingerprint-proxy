@@ -1,5 +1,7 @@
-use crate::frames::{parse_websocket_frame_prefix, WebSocketOpcode};
+use crate::frames::{parse_websocket_frame_prefix_with_max_payload, WebSocketOpcode};
 use fingerprint_proxy_core::error::{FpError, FpResult};
+
+pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSocketProxyDirection {
@@ -19,17 +21,39 @@ pub struct WebSocketProxyProgress {
     pub terminal_state: WebSocketProxyTerminalState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebSocketProxyLimits {
+    pub max_frame_payload_bytes: usize,
+}
+
+impl Default for WebSocketProxyLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_payload_bytes: DEFAULT_MAX_FRAME_PAYLOAD_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketProxyState {
     direction: WebSocketProxyDirection,
+    limits: WebSocketProxyLimits,
     buffered: Vec<u8>,
     terminal_state: WebSocketProxyTerminalState,
 }
 
 impl WebSocketProxyState {
     pub fn new(direction: WebSocketProxyDirection) -> Self {
+        Self::new_with_limits(direction, WebSocketProxyLimits::default())
+    }
+
+    pub fn new_with_limits(
+        direction: WebSocketProxyDirection,
+        limits: WebSocketProxyLimits,
+    ) -> Self {
         Self {
             direction,
+            limits,
             buffered: Vec::new(),
             terminal_state: WebSocketProxyTerminalState::Open,
         }
@@ -41,7 +65,10 @@ impl WebSocketProxyState {
         let mut offset = 0usize;
         let mut terminal_state = self.terminal_state;
         while offset < self.buffered.len() {
-            let Some((frame, consumed)) = parse_websocket_frame_prefix(&self.buffered[offset..])?
+            let Some((frame, consumed)) = parse_websocket_frame_prefix_with_max_payload(
+                &self.buffered[offset..],
+                self.limits.max_frame_payload_bytes,
+            )?
             else {
                 break;
             };

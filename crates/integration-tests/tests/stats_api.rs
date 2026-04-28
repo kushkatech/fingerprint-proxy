@@ -210,7 +210,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"
@@ -267,7 +267,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"
@@ -369,7 +369,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"
@@ -421,7 +421,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"
@@ -479,7 +479,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"
@@ -531,7 +531,7 @@ bind = "127.0.0.1:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert}"
-private_key_pem_path = "{key}"
+private_key_provider = {{ kind = "file", pem_path = "{key}" }}
 
 [default_certificate_policy]
 kind = "use_default"

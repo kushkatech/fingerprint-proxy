@@ -56,6 +56,8 @@ project contract. It is a review aid, not a replacement for the specification.
 - [x] Deterministic protocol-boundary failure model.
 - [x] Stats API allowlist/authentication controls.
 - [x] Sensitive stats/logging filtering foundations.
+- [x] TLS private-key provider boundary and local `file` provider.
+- [ ] Real provider-backed/HSM TLS signing backend.
 - [x] Security hardening review document.
 - [ ] Full public-release dependency/security audit.
 
@@ -70,5 +72,10 @@ project contract. It is a review aid, not a replacement for the specification.
 
 ## Canonical Open Compliance Gap
 
-HTTP/3 over QUIC is the remaining canonical runtime compliance gap. It is
-tracked by Phase 22 tasks and `T291`.
+HTTP/3 over QUIC is the remaining canonical protocol runtime compliance gap. It
+is tracked by Phase 22 tasks and `T291`.
+
+Provider-backed/HSM TLS private-key signing is also not implemented. Branch
+`160` added the `private_key_provider` boundary and local `file` provider only;
+real PKCS#11/KMS/TPM/HSM signing backend selection and implementation remains
+tracked by `T328`.

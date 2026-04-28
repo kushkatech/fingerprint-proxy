@@ -22,7 +22,24 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
                     "listeners must be empty in inherited_systemd mode",
                 ));
             }
+            if config.enable_http3_quic_listeners {
+                report.push(ValidationIssue::error(
+                    "bootstrap.enable_http3_quic_listeners",
+                    "HTTP/3 QUIC listeners are not supported in inherited_systemd mode",
+                ));
+            }
         }
+    }
+
+    if matches!(
+        config.fingerprinting.ja4t.missing_tcp_metadata_policy,
+        Ja4TMissingTcpMetadataPolicy::AllowUnavailable
+    ) {
+        report.push(ValidationIssue {
+            severity: IssueSeverity::Warning,
+            path: "bootstrap.fingerprinting.ja4t.missing_tcp_metadata_policy".to_string(),
+            message: "JA4T missing TCP metadata policy allow_unavailable is intended only for testing/debugging; JA4T will be unavailable when saved-SYN capability cannot be acquired".to_string(),
+        });
     }
 
     if config.stats_api.enabled {
@@ -109,12 +126,7 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
                 "certificate_pem_path must be non-empty",
             ));
         }
-        if cert.private_key_pem_path.trim().is_empty() {
-            report.push(ValidationIssue::error(
-                format!("{base}.private_key_pem_path"),
-                "private_key_pem_path must be non-empty",
-            ));
-        }
+        validate_private_key_provider(&base, &cert.private_key_provider, &mut report);
 
         for (pidx, pat) in cert.server_names.iter().enumerate() {
             let pbase = format!("{base}.server_names[{pidx}]");
@@ -167,6 +179,77 @@ pub fn validate_bootstrap_config(config: &BootstrapConfig) -> ValidationReport {
             report.push(ValidationIssue::error(
                 "bootstrap.dynamic_provider.polling_interval_seconds",
                 "dynamic polling interval must be greater than zero",
+            ));
+        }
+    }
+
+    report
+}
+
+fn validate_private_key_provider(
+    base: &str,
+    provider: &TlsPrivateKeyProviderConfig,
+    report: &mut ValidationReport,
+) {
+    match provider {
+        TlsPrivateKeyProviderConfig::File(file) => {
+            if file.pem_path.trim().is_empty() {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.pem_path"),
+                    "file private key provider pem_path must be non-empty",
+                ));
+            }
+        }
+        TlsPrivateKeyProviderConfig::KnownUnsupported(kind) => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.kind"),
+                format!(
+                    "private key provider kind `{}` is recognized but not supported in this build; only `file` is implemented",
+                    kind.as_str()
+                ),
+            ));
+        }
+        TlsPrivateKeyProviderConfig::Unknown(provider) => {
+            if provider.kind.trim().is_empty() {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.kind"),
+                    "private key provider kind must be non-empty",
+                ));
+            } else {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.kind"),
+                    format!(
+                        "unknown private key provider kind `{}`; supported kind is `file`; recognized-but-unsupported kinds are `pkcs11`, `kms`, `tpm`",
+                        provider.kind
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+pub fn validate_http3_quic_listener_policy(
+    bootstrap: &BootstrapConfig,
+    domain: &DomainConfig,
+) -> ValidationReport {
+    let mut report = ValidationReport::default();
+    let has_http3_vhost = domain
+        .virtual_hosts
+        .iter()
+        .any(|vhost| vhost.protocol.allow_http3);
+
+    match (bootstrap.enable_http3_quic_listeners, has_http3_vhost) {
+        (true, true) | (false, false) => {}
+        (false, true) => {
+            report.push(ValidationIssue::error(
+                "bootstrap.enable_http3_quic_listeners",
+                "one or more virtual hosts allow HTTP/3 but bootstrap HTTP/3 QUIC listeners are disabled",
+            ));
+        }
+        (true, false) => {
+            report.push(ValidationIssue::error(
+                "bootstrap.enable_http3_quic_listeners",
+                "bootstrap HTTP/3 QUIC listeners are enabled but no virtual host allows HTTP/3",
             ));
         }
     }
@@ -249,6 +332,13 @@ pub fn validate_domain_config(config: &DomainConfig) -> ValidationReport {
                     }
                 }
             }
+        }
+
+        if vhost.protocol.http2_server_push_policy == Http2ServerPushPolicy::Forward {
+            report.push(ValidationIssue::error(
+                format!("{base}.protocol.http2_server_push_policy"),
+                "HTTP/2 server push forwarding is not supported; use suppress",
+            ));
         }
 
         for (pidx, pat) in vhost.match_criteria.sni.iter().enumerate() {

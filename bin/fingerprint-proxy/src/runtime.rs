@@ -1,6 +1,8 @@
+use fingerprint_proxy_bootstrap_config::config::Ja4TMissingTcpMetadataPolicy;
 use fingerprint_proxy_bootstrap_config::dynamic::upstream_check::{
     TcpConnectUpstreamChecker, UpstreamConnectivityChecker, UpstreamValidationTarget,
 };
+use fingerprint_proxy_bootstrap_config::validation::validate_http3_quic_listener_policy;
 use fingerprint_proxy_core::connection::{ConnectionContext, TransportProtocol};
 use fingerprint_proxy_core::enrichment::{
     ClientNetworkCidr, ClientNetworkClassificationRule, ProcessingStage,
@@ -11,6 +13,7 @@ use fingerprint_proxy_core::fingerprint::{
     FingerprintKind, Fingerprints,
 };
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
+use fingerprint_proxy_core::http_date::current_http_date;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
 use fingerprint_proxy_core::request::RequestContext;
 use fingerprint_proxy_core::request::{HttpRequest, HttpResponse};
@@ -24,7 +27,7 @@ use fingerprint_proxy_fingerprinting::{
 };
 use fingerprint_proxy_hpack::HeaderField as HpackHeaderField;
 use fingerprint_proxy_http1::{parse_websocket_upgrade_response_head, serialize_http1_response};
-use fingerprint_proxy_http1_orchestrator::Http1RouterDeps;
+use fingerprint_proxy_http1_orchestrator::{Http1RouterDeps, Limits as Http1ClientLimits};
 use fingerprint_proxy_http2::frames::{
     serialize_frame as serialize_http2_frame, Frame as Http2Frame, FrameHeader as Http2FrameHeader,
     FramePayload as Http2FramePayload, FrameType as Http2FrameType,
@@ -33,9 +36,9 @@ use fingerprint_proxy_http2::{
     finalize_grpc_http2_response, grpc_http2_request_requires_transparent_forwarding,
     map_headers_to_response as map_http2_headers_to_response, prepare_grpc_http2_request,
     validate_h2c_prior_knowledge_preface, ConnectionPreface as Http2ConnectionPreface,
-    Settings as Http2Settings, StreamId as Http2StreamId,
+    HeaderField as Http2HeaderField, Settings as Http2Settings, StreamId as Http2StreamId,
 };
-use fingerprint_proxy_http2_orchestrator::RouterDeps as Http2RouterDeps;
+use fingerprint_proxy_http2_orchestrator::{GrpcStreamingStart, RouterDeps as Http2RouterDeps};
 use fingerprint_proxy_http3_orchestrator::RouterDeps as Http3RouterDeps;
 use fingerprint_proxy_pipeline::{Pipeline, PipelineRegistry, PipelineRegistryConfig};
 use fingerprint_proxy_pipeline_modules::fingerprint_header::{
@@ -46,7 +49,9 @@ use fingerprint_proxy_pipeline_modules::forward::{
     ensure_pipeline_forwarding_ready, ContinuedForwardProtocol,
 };
 use fingerprint_proxy_pipeline_modules::register_builtin_modules;
-use fingerprint_proxy_prepipeline::PrePipelineInput;
+use fingerprint_proxy_prepipeline::{
+    run_prepared_pipeline, OrchestrationOutcome, PrePipelineInput,
+};
 use fingerprint_proxy_quic::{
     parse_packet_header as parse_quic_packet_header, QuicEstablishment, QuicEstablishmentError,
     QuicPacketError,
@@ -73,7 +78,8 @@ use fingerprint_proxy_upstream::{
     UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE,
 };
 use fingerprint_proxy_websocket::{
-    proxy_websocket_bidirectionally, validate_websocket_handshake_response,
+    proxy_websocket_bidirectionally_with_limits, validate_websocket_handshake_response,
+    WebSocketProxyLimits,
 };
 use rustls::crypto::ring::default_provider as default_tls_provider;
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -84,11 +90,11 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinSet};
 use tokio_rustls::LazyConfigAcceptor;
 
@@ -124,6 +130,97 @@ const TCP_SAVED_SYN_LINUX: libc::c_int = 28;
 const TCP_SAVED_SYN_BUFFER_BYTES: usize = 512;
 const TCP_SAVED_SYN_MIN_KERNEL: &str = "Linux 4.3+";
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeSettings {
+    upstream_connect_timeout: Option<std::time::Duration>,
+    upstream_request_timeout: std::time::Duration,
+    http1_client_limits: Http1ClientLimits,
+    http1_upstream_limits: Http1UpstreamLimits,
+    http2_upstream_limits: Http2UpstreamLimits,
+    websocket_proxy_limits: WebSocketProxyLimits,
+}
+
+impl RuntimeSettings {
+    fn from_bootstrap(
+        bootstrap: &fingerprint_proxy_bootstrap_config::config::BootstrapConfig,
+    ) -> Self {
+        let defaults = Self::default();
+        Self {
+            upstream_connect_timeout: bootstrap.timeouts.upstream_connect_timeout,
+            upstream_request_timeout: bootstrap
+                .timeouts
+                .request_timeout
+                .unwrap_or(defaults.upstream_request_timeout),
+            http1_client_limits: Http1ClientLimits {
+                max_header_bytes: bootstrap
+                    .limits
+                    .max_header_bytes
+                    .unwrap_or(defaults.http1_client_limits.max_header_bytes),
+                max_body_bytes: bootstrap
+                    .limits
+                    .max_body_bytes
+                    .unwrap_or(defaults.http1_client_limits.max_body_bytes),
+                max_requests_per_connection: defaults
+                    .http1_client_limits
+                    .max_requests_per_connection,
+            },
+            http1_upstream_limits: Http1UpstreamLimits {
+                max_header_bytes: bootstrap
+                    .limits
+                    .max_header_bytes
+                    .unwrap_or(defaults.http1_upstream_limits.max_header_bytes),
+                max_body_bytes: bootstrap
+                    .limits
+                    .max_body_bytes
+                    .unwrap_or(defaults.http1_upstream_limits.max_body_bytes),
+            },
+            http2_upstream_limits: Http2UpstreamLimits {
+                max_body_bytes: bootstrap
+                    .limits
+                    .max_body_bytes
+                    .unwrap_or(defaults.http2_upstream_limits.max_body_bytes),
+            },
+            websocket_proxy_limits: WebSocketProxyLimits {
+                max_frame_payload_bytes: bootstrap
+                    .limits
+                    .max_body_bytes
+                    .unwrap_or(defaults.websocket_proxy_limits.max_frame_payload_bytes),
+            },
+        }
+    }
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            upstream_connect_timeout: None,
+            upstream_request_timeout: DEFAULT_UPSTREAM_READ_TIMEOUT,
+            http1_client_limits: Http1ClientLimits::default(),
+            http1_upstream_limits: Http1UpstreamLimits::default(),
+            http2_upstream_limits: Http2UpstreamLimits::default(),
+            websocket_proxy_limits: WebSocketProxyLimits::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeUpstreamSettings {
+    tls_client_config: Arc<rustls::ClientConfig>,
+    runtime_settings: RuntimeSettings,
+}
+
+impl RuntimeUpstreamSettings {
+    fn new(
+        tls_client_config: Arc<rustls::ClientConfig>,
+        runtime_settings: RuntimeSettings,
+    ) -> Self {
+        Self {
+            tls_client_config,
+            runtime_settings,
+        }
+    }
+}
+
 pub async fn run() -> FpResult<()> {
     let bootstrap = crate::config_loading::load_bootstrap_config()?;
 
@@ -141,7 +238,10 @@ pub async fn run() -> FpResult<()> {
         RuntimeTlsServerConfigs::new(tls_assets.selection.clone(), tls_assets.keys_by_id)?;
 
     let pipeline = Arc::new(build_runtime_pipeline(&bootstrap.module_enabled)?);
-    let deps = RuntimeDeps::new(Arc::clone(&pipeline));
+    let deps = RuntimeDeps::new_with_settings(
+        Arc::clone(&pipeline),
+        RuntimeSettings::from_bootstrap(&bootstrap),
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -182,24 +282,34 @@ async fn run_until_shutdown(
     let operational_state = deps.operational_state.clone();
     let mut supervisor = RuntimeTaskSupervisor::new(operational_state);
     let bootstrap_for_dynamic_config = bootstrap.clone();
-    let runtime_listeners =
-        acquire_runtime_listener_set(bootstrap.listener_acquisition_mode, &bootstrap.listeners)
-            .await?;
+    if !deps.dynamic_config_state.is_initialized()? {
+        let initial_domain =
+            fingerprint_proxy_bootstrap_config::domain_provider::load_domain_config()?;
+        deps.dynamic_config_state
+            .initialize(initial_domain, tls_server_configs.current_material())?;
+    }
+    let active_domain_snapshot = deps.dynamic_config_state.active_snapshot()?;
+    let http3_policy_report =
+        validate_http3_quic_listener_policy(&bootstrap, active_domain_snapshot.config());
+    if http3_policy_report.has_errors() {
+        return Err(FpError::validation_failed(format!(
+            "HTTP/3 QUIC listener policy validation failed:\n{http3_policy_report}"
+        )));
+    }
+    let runtime_listeners = acquire_runtime_listener_set(
+        bootstrap.listener_acquisition_mode,
+        bootstrap.enable_http3_quic_listeners,
+        bootstrap.fingerprinting.ja4t.missing_tcp_metadata_policy,
+        &bootstrap.listeners,
+    )
+    .await?;
 
     for listener in runtime_listeners.tcp {
-        let tls_server_configs = tls_server_configs.clone();
         let deps = deps.clone_for_connection();
         let shutdown_rx = shutdown.clone();
 
         supervisor.spawn(async move {
-            serve_listener(
-                listener,
-                tls_server_configs,
-                deps,
-                shutdown_rx,
-                graceful_timeout,
-            )
-            .await
+            serve_listener(listener, deps, shutdown_rx, graceful_timeout).await
         });
     }
 
@@ -345,37 +455,61 @@ fn is_graceful_shutdown_timeout(err: &FpError) -> bool {
 
 async fn acquire_runtime_listener_set(
     mode: fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode,
+    enable_http3_quic_listeners: bool,
+    ja4t_missing_tcp_metadata_policy: Ja4TMissingTcpMetadataPolicy,
     listeners: &[fingerprint_proxy_bootstrap_config::config::ListenerConfig],
 ) -> FpResult<RuntimeListenerSet> {
-    acquire_runtime_listener_set_with(mode, listeners, || {
-        Ok(acquire_systemd_inherited_tcp_listeners()?
-            .into_iter()
-            .map(|inherited| inherited.listener)
-            .collect())
-    })
+    acquire_runtime_listener_set_with(
+        mode,
+        enable_http3_quic_listeners,
+        ja4t_missing_tcp_metadata_policy,
+        listeners,
+        || {
+            Ok(acquire_systemd_inherited_tcp_listeners()?
+                .into_iter()
+                .map(|inherited| inherited.listener)
+                .collect())
+        },
+        enable_runtime_saved_syn_on_tokio_listener,
+    )
     .await
 }
 
-async fn acquire_runtime_listener_set_with<F>(
+async fn acquire_runtime_listener_set_with<F, E>(
     mode: fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode,
+    enable_http3_quic_listeners: bool,
+    ja4t_missing_tcp_metadata_policy: Ja4TMissingTcpMetadataPolicy,
     listeners: &[fingerprint_proxy_bootstrap_config::config::ListenerConfig],
     acquire_inherited: F,
+    enable_saved_syn: E,
 ) -> FpResult<RuntimeListenerSet>
 where
     F: FnOnce() -> FpResult<Vec<std::net::TcpListener>>,
+    E: Fn(&TcpListener) -> FpResult<()> + Copy,
 {
-    let tcp = acquire_runtime_listeners_with(mode, listeners, acquire_inherited).await?;
-    let quic_udp = acquire_runtime_udp_sockets(mode, listeners).await?;
+    let tcp = acquire_runtime_listeners_with(
+        mode,
+        listeners,
+        ja4t_missing_tcp_metadata_policy,
+        acquire_inherited,
+        enable_saved_syn,
+    )
+    .await?;
+    let quic_udp =
+        acquire_runtime_udp_sockets(mode, enable_http3_quic_listeners, listeners).await?;
     Ok(RuntimeListenerSet { tcp, quic_udp })
 }
 
-async fn acquire_runtime_listeners_with<F>(
+async fn acquire_runtime_listeners_with<F, E>(
     mode: fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode,
     listeners: &[fingerprint_proxy_bootstrap_config::config::ListenerConfig],
+    ja4t_missing_tcp_metadata_policy: Ja4TMissingTcpMetadataPolicy,
     acquire_inherited: F,
+    enable_saved_syn: E,
 ) -> FpResult<Vec<TcpListener>>
 where
     F: FnOnce() -> FpResult<Vec<std::net::TcpListener>>,
+    E: Fn(&TcpListener) -> FpResult<()> + Copy,
 {
     match mode {
         fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode::DirectBind => {
@@ -384,7 +518,11 @@ where
                 let listener = TcpListener::bind(listener_cfg.bind)
                     .await
                     .map_err(|e| FpError::internal(format!("bind failed: {e}")))?;
-                enable_runtime_saved_syn_on_tokio_listener(&listener)?;
+                apply_ja4t_saved_syn_startup_policy(
+                    &listener,
+                    ja4t_missing_tcp_metadata_policy,
+                    enable_saved_syn,
+                )?;
                 bound.push(listener);
             }
             Ok(bound)
@@ -398,7 +536,11 @@ where
                         "failed to adapt inherited systemd TCP listener at index {idx}: {e}"
                     ))
                 })?;
-                enable_runtime_saved_syn_on_tokio_listener(&listener)?;
+                apply_ja4t_saved_syn_startup_policy(
+                    &listener,
+                    ja4t_missing_tcp_metadata_policy,
+                    enable_saved_syn,
+                )?;
                 adapted.push(listener);
             }
             Ok(adapted)
@@ -406,10 +548,35 @@ where
     }
 }
 
+fn apply_ja4t_saved_syn_startup_policy<E>(
+    listener: &TcpListener,
+    policy: Ja4TMissingTcpMetadataPolicy,
+    enable_saved_syn: E,
+) -> FpResult<()>
+where
+    E: Fn(&TcpListener) -> FpResult<()>,
+{
+    match enable_saved_syn(listener) {
+        Ok(()) => Ok(()),
+        Err(err) => match policy {
+            Ja4TMissingTcpMetadataPolicy::FailStartup => Err(err),
+            Ja4TMissingTcpMetadataPolicy::AllowUnavailable => {
+                crate::runtime_logging::log_ja4t_saved_syn_startup_unavailable(&err);
+                Ok(())
+            }
+        },
+    }
+}
+
 async fn acquire_runtime_udp_sockets(
     mode: fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode,
+    enable_http3_quic_listeners: bool,
     listeners: &[fingerprint_proxy_bootstrap_config::config::ListenerConfig],
 ) -> FpResult<Vec<UdpSocket>> {
+    if !enable_http3_quic_listeners {
+        return Ok(Vec::new());
+    }
+
     match mode {
         fingerprint_proxy_bootstrap_config::config::ListenerAcquisitionMode::DirectBind => {
             let mut bound = Vec::with_capacity(listeners.len());
@@ -451,7 +618,6 @@ async fn wait_for_shutdown_signal() {
 
 async fn serve_listener(
     listener: TcpListener,
-    tls_server_configs: RuntimeTlsServerConfigs,
     deps: RuntimeDeps,
     mut shutdown: watch::Receiver<bool>,
     graceful_timeout: std::time::Duration,
@@ -468,11 +634,10 @@ async fn serve_listener(
             }
             res = listener.accept() => {
                 let (tcp, _peer) = res.map_err(|e| FpError::internal(format!("accept failed: {e}")))?;
-                let tls_server_configs = tls_server_configs.clone();
 
                 let mut deps = deps.clone_for_connection();
                 connections.spawn(async move {
-                    handle_connection(tcp, tls_server_configs, &mut deps).await
+                    handle_connection(tcp, &mut deps).await
                 });
             }
         }
@@ -550,31 +715,26 @@ fn map_quic_establishment_error(error: QuicEstablishmentError) -> FpError {
     FpError::invalid_protocol_data(format!("QUIC UDP establishment error: {error:?}"))
 }
 
-async fn handle_connection(
-    tcp: TcpStream,
-    tls_server_configs: RuntimeTlsServerConfigs,
-    deps: &mut RuntimeDeps,
-) -> FpResult<()> {
-    handle_connection_with_read_buf_size(tcp, tls_server_configs, deps, 4096).await
+async fn handle_connection(tcp: TcpStream, deps: &mut RuntimeDeps) -> FpResult<()> {
+    handle_connection_with_read_buf_size(tcp, deps, 4096).await
 }
 
 async fn handle_connection_with_read_buf_size(
     tcp: TcpStream,
-    tls_server_configs: RuntimeTlsServerConfigs,
     deps: &mut RuntimeDeps,
     read_buf_size: usize,
 ) -> FpResult<()> {
     let _connection_guard = deps.http1.connection_stats.open_connection(unix_now());
     let peer_addr = tcp.peer_addr().ok();
     let local_addr = tcp.local_addr().ok();
-    deps.http1.ensure_domain_config_loaded()?;
-    deps.http2.ensure_domain_config_loaded()?;
-    let domain = deps
+    deps.http1.ensure_runtime_config_loaded()?;
+    deps.http2.bind_runtime_snapshot_from_http1(&deps.http1)?;
+    let runtime_snapshot = deps
         .http1
-        .bound_domain_snapshot
+        .bound_runtime_snapshot
         .get()
-        .map(|snapshot| snapshot.config())
-        .ok_or_else(|| FpError::internal("domain config is missing before TLS handshake"))?;
+        .ok_or_else(|| FpError::internal("runtime config is missing before TLS handshake"))?;
+    let domain = runtime_snapshot.config();
 
     let runtime_tcp_metadata = capture_runtime_tcp_metadata(&tcp);
     if accepted_connection_is_h2c_prior_knowledge(&tcp).await? {
@@ -610,8 +770,12 @@ async fn handle_connection_with_read_buf_size(
         .server_name()
         .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty());
-    let server_config =
-        tls_server_configs.server_config_for_connection(domain, sni.as_deref(), local_addr)?;
+    let server_config = RuntimeTlsServerConfigs::server_config_for_connection_from_material(
+        runtime_snapshot.tls_material(),
+        domain,
+        sni.as_deref(),
+        local_addr,
+    )?;
 
     let mut tls = start
         .into_stream(server_config)
@@ -660,13 +824,43 @@ async fn handle_connection_with_read_buf_size(
         }
     }
 
-    let mut dispatcher = TlsEntryDispatcher::new();
+    let mut dispatcher =
+        TlsEntryDispatcher::with_http1_limits(deps.http1.runtime_settings.http1_client_limits);
     let mut buf = vec![0u8; read_buf_size];
     loop {
-        let n = tls
-            .read(&mut buf[..])
-            .await
-            .map_err(|e| FpError::invalid_protocol_data(format!("TLS read failed: {e}")))?;
+        let n = if matches!(negotiated_alpn, Some(NegotiatedAlpn::Http2))
+            && deps.http2.has_continued_tasks()
+        {
+            enum Http2RuntimeEvent {
+                Read(FpResult<usize>),
+                Continued(FpResult<Option<Vec<Http2Frame>>>),
+            }
+
+            let event = tokio::select! {
+                read = tls.read(&mut buf[..]) => {
+                    Http2RuntimeEvent::Read(read.map_err(|e| {
+                        FpError::invalid_protocol_data(format!("TLS read failed: {e}"))
+                    }))
+                }
+                continued = deps.http2.next_continued_response_frames(), if deps.http2.has_continued_tasks() => {
+                    Http2RuntimeEvent::Continued(continued)
+                }
+            };
+
+            match event {
+                Http2RuntimeEvent::Read(read) => read?,
+                Http2RuntimeEvent::Continued(frames) => {
+                    if let Some(frames) = frames? {
+                        write_http2_frames_to_async(&mut tls, &frames, "TLS write failed").await?;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tls.read(&mut buf[..])
+                .await
+                .map_err(|e| FpError::invalid_protocol_data(format!("TLS read failed: {e}")))?
+        };
         if n == 0 {
             if matches!(negotiated_alpn, Some(NegotiatedAlpn::Http1)) {
                 let _ = dispatcher
@@ -705,6 +899,15 @@ async fn handle_connection_with_read_buf_size(
                         .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
                 }
             }
+            DispatcherOutput::Http1CloseAfterResponses(responses) => {
+                for resp in responses {
+                    tls.write_all(&resp)
+                        .await
+                        .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
+                }
+                let _ = tls.shutdown().await;
+                return Ok(());
+            }
             DispatcherOutput::Http1WebSocketUpgrade(upgrade) => {
                 deps.http1
                     .forward_websocket_continued(
@@ -716,17 +919,7 @@ async fn handle_connection_with_read_buf_size(
                 return Ok(());
             }
             DispatcherOutput::Http2Frames(frames) => {
-                for frame in frames {
-                    let bytes =
-                        fingerprint_proxy_http2::frames::serialize_frame(&frame).map_err(|e| {
-                            FpError::invalid_protocol_data(format!(
-                                "HTTP/2 frame encode error: {e}"
-                            ))
-                        })?;
-                    tls.write_all(&bytes)
-                        .await
-                        .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
-                }
+                write_http2_frames_to_async(&mut tls, &frames, "TLS write failed").await?;
             }
             DispatcherOutput::Http3Frames(_frames) => {
                 return Err(FpError::internal(
@@ -780,14 +973,43 @@ async fn handle_h2c_prior_knowledge_connection(
     deps.http2
         .set_runtime_fingerprinting_result(runtime_fingerprinting_result);
 
-    let mut dispatcher = TlsEntryDispatcher::new();
+    let mut dispatcher =
+        TlsEntryDispatcher::with_http1_limits(deps.http1.runtime_settings.http1_client_limits);
     let negotiated_alpn = Some(NegotiatedAlpn::Http2);
     let mut buf = vec![0u8; read_buf_size];
     loop {
-        let n = tcp
-            .read(&mut buf[..])
-            .await
-            .map_err(|e| FpError::invalid_protocol_data(format!("TCP h2c read failed: {e}")))?;
+        let n = if deps.http2.has_continued_tasks() {
+            enum Http2RuntimeEvent {
+                Read(FpResult<usize>),
+                Continued(FpResult<Option<Vec<Http2Frame>>>),
+            }
+
+            let event = tokio::select! {
+                read = tcp.read(&mut buf[..]) => {
+                    Http2RuntimeEvent::Read(read.map_err(|e| {
+                        FpError::invalid_protocol_data(format!("TCP h2c read failed: {e}"))
+                    }))
+                }
+                continued = deps.http2.next_continued_response_frames(), if deps.http2.has_continued_tasks() => {
+                    Http2RuntimeEvent::Continued(continued)
+                }
+            };
+
+            match event {
+                Http2RuntimeEvent::Read(read) => read?,
+                Http2RuntimeEvent::Continued(frames) => {
+                    if let Some(frames) = frames? {
+                        write_http2_frames_to_async(&mut tcp, &frames, "TCP h2c write failed")
+                            .await?;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            tcp.read(&mut buf[..])
+                .await
+                .map_err(|e| FpError::invalid_protocol_data(format!("TCP h2c read failed: {e}")))?
+        };
         if n == 0 {
             return Ok(());
         }
@@ -801,19 +1023,10 @@ async fn handle_h2c_prior_knowledge_connection(
             .await?;
         match output {
             DispatcherOutput::Http2Frames(frames) => {
-                for frame in frames {
-                    let bytes =
-                        fingerprint_proxy_http2::frames::serialize_frame(&frame).map_err(|e| {
-                            FpError::invalid_protocol_data(format!(
-                                "HTTP/2 frame encode error: {e}"
-                            ))
-                        })?;
-                    tcp.write_all(&bytes)
-                        .await
-                        .map_err(|e| FpError::internal(format!("TCP h2c write failed: {e}")))?;
-                }
+                write_http2_frames_to_async(&mut tcp, &frames, "TCP h2c write failed").await?;
             }
             DispatcherOutput::Http1Responses(_)
+            | DispatcherOutput::Http1CloseAfterResponses(_)
             | DispatcherOutput::Http1WebSocketUpgrade(_)
             | DispatcherOutput::Http3Frames(_) => {
                 return Err(FpError::internal(
@@ -835,11 +1048,11 @@ struct Http1Deps {
     fingerprinting_stats: FingerprintingStatsIntegration,
     connection_stats: ConnectionStatsIntegration,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
-    bound_domain_snapshot: std::sync::OnceLock<
-        Arc<fingerprint_proxy_bootstrap_config::dynamic::atomic_update::DynamicConfigSnapshot>,
-    >,
+    bound_runtime_snapshot:
+        std::sync::OnceLock<Arc<crate::dynamic_config::RuntimeDynamicConfigSnapshot>>,
     readiness_upstream_cache: Arc<RuntimeReadinessUpstreamCache>,
     upstream_connection_manager: UpstreamConnectionManager,
+    runtime_settings: RuntimeSettings,
     tls_sni: Option<String>,
     peer_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
@@ -853,8 +1066,9 @@ impl Http1Deps {
         operational_state: crate::health::SharedRuntimeOperationalState,
         runtime_stats: Arc<RuntimeStatsRegistry>,
         dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
-        upstream_tls_client_config: Arc<rustls::ClientConfig>,
+        upstream_settings: RuntimeUpstreamSettings,
     ) -> Self {
+        let runtime_settings = upstream_settings.runtime_settings;
         Self {
             pipeline,
             next_request_id,
@@ -865,9 +1079,13 @@ impl Http1Deps {
             fingerprinting_stats: FingerprintingStatsIntegration::new(Arc::clone(&runtime_stats)),
             connection_stats: connection_stats_integration(runtime_stats),
             dynamic_config_state,
-            bound_domain_snapshot: std::sync::OnceLock::new(),
+            bound_runtime_snapshot: std::sync::OnceLock::new(),
             readiness_upstream_cache: Arc::new(RuntimeReadinessUpstreamCache::default()),
-            upstream_connection_manager: UpstreamConnectionManager::new(upstream_tls_client_config),
+            upstream_connection_manager: UpstreamConnectionManager::new_with_connect_timeout(
+                upstream_settings.tls_client_config,
+                runtime_settings.upstream_connect_timeout,
+            ),
+            runtime_settings,
             tls_sni: None,
             peer_addr: None,
             local_addr: None,
@@ -885,22 +1103,29 @@ impl Http1Deps {
             fingerprinting_stats: self.fingerprinting_stats.clone(),
             connection_stats: self.connection_stats.clone(),
             dynamic_config_state: self.dynamic_config_state.clone(),
-            bound_domain_snapshot: std::sync::OnceLock::new(),
+            bound_runtime_snapshot: std::sync::OnceLock::new(),
             readiness_upstream_cache: Arc::clone(&self.readiness_upstream_cache),
             upstream_connection_manager: self.upstream_connection_manager.clone(),
+            runtime_settings: self.runtime_settings,
             tls_sni: None,
             peer_addr: None,
             local_addr: None,
         }
     }
 
-    fn ensure_domain_config_loaded(&self) -> FpResult<()> {
-        if self.bound_domain_snapshot.get().is_some() {
+    fn ensure_runtime_config_loaded(&self) -> FpResult<()> {
+        if self.bound_runtime_snapshot.get().is_some() {
             return Ok(());
         }
         let snapshot = self.dynamic_config_state.active_snapshot()?;
-        let _ = self.bound_domain_snapshot.set(snapshot);
+        let _ = self.bound_runtime_snapshot.set(snapshot);
         Ok(())
+    }
+
+    fn bound_runtime_snapshot(
+        &self,
+    ) -> Option<Arc<crate::dynamic_config::RuntimeDynamicConfigSnapshot>> {
+        self.bound_runtime_snapshot.get().cloned()
     }
 
     #[cfg(test)]
@@ -911,17 +1136,19 @@ impl Http1Deps {
         self.dynamic_config_state
             .replace_active_domain_config_for_tests(domain_config.clone())
             .expect("set test dynamic state");
-        let snapshot = Arc::new(
-            fingerprint_proxy_bootstrap_config::dynamic::atomic_update::DynamicConfigSnapshot::from_domain_config(
-                domain_config,
-            ),
-        );
-        let _ = self.bound_domain_snapshot.set(snapshot);
+        let snapshot = self
+            .dynamic_config_state
+            .active_snapshot()
+            .expect("test runtime snapshot");
+        let _ = self.bound_runtime_snapshot.set(snapshot);
     }
 
     #[cfg(test)]
     fn set_upstream_tls_client_config(&mut self, cfg: Arc<rustls::ClientConfig>) {
-        self.upstream_connection_manager = UpstreamConnectionManager::new(cfg);
+        self.upstream_connection_manager = UpstreamConnectionManager::new_with_connect_timeout(
+            cfg,
+            self.runtime_settings.upstream_connect_timeout,
+        );
     }
 
     fn set_tls_sni(&mut self, tls_sni: Option<String>) {
@@ -941,7 +1168,7 @@ impl Http1Deps {
 
     fn runtime_health_state(&self) -> crate::health::RuntimeHealthState {
         let snapshot = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|snapshot| snapshot.config());
         let upstreams_reachable =
@@ -995,7 +1222,7 @@ impl Http1Deps {
     fn selected_virtual_host(
         &self,
     ) -> Option<&fingerprint_proxy_bootstrap_config::config::VirtualHostConfig> {
-        let domain = self.bound_domain_snapshot.get()?.config();
+        let domain = self.bound_runtime_snapshot.get()?.config();
         select_virtual_host(domain, self.tls_sni.as_deref(), self.local_addr)
     }
 
@@ -1042,7 +1269,7 @@ impl Http1Deps {
         }
 
         let domain = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|s| s.config())
             .ok_or_else(|| {
@@ -1065,6 +1292,9 @@ impl Http1Deps {
                 response
                     .headers
                     .insert("Content-Length".to_string(), "0".to_string());
+                response
+                    .headers
+                    .insert("Date".to_string(), current_http_date());
                 response
                     .headers
                     .insert("Connection".to_string(), "close".to_string());
@@ -1161,8 +1391,8 @@ impl Http1Deps {
 
                     let response_result = read_http1_response_async(
                         &mut upstream,
-                        Http1UpstreamLimits::default(),
-                        DEFAULT_UPSTREAM_READ_TIMEOUT,
+                        self.runtime_settings.http1_upstream_limits,
+                        self.runtime_settings.upstream_request_timeout,
                     )
                     .await;
                     match response_result {
@@ -1232,7 +1462,7 @@ impl Http1Deps {
         ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http1)?;
 
         let domain = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|s| s.config())
             .ok_or_else(|| {
@@ -1301,7 +1531,13 @@ impl Http1Deps {
         }
 
         let (mut upstream_response, initial_upstream_bytes) =
-            match read_websocket_upgrade_response_async(&mut upstream).await {
+            match read_websocket_upgrade_response_async(
+                &mut upstream,
+                self.runtime_settings.http1_upstream_limits,
+                self.runtime_settings.upstream_request_timeout,
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(e) => {
                     self.connection_stats.record_upstream_error(unix_now());
@@ -1350,11 +1586,12 @@ impl Http1Deps {
             .await
             .map_err(|e| FpError::internal(format!("TLS write failed: {e}")))?;
 
-        proxy_websocket_bidirectionally(
+        proxy_websocket_bidirectionally_with_limits(
             tls,
             &mut upstream,
             &initial_client_bytes,
             &initial_upstream_bytes,
+            self.runtime_settings.websocket_proxy_limits,
         )
         .await
     }
@@ -1436,13 +1673,20 @@ struct RuntimeDeps {
 }
 
 impl RuntimeDeps {
+    #[cfg(test)]
     fn new(pipeline: Arc<Pipeline>) -> Self {
+        Self::new_with_settings(pipeline, RuntimeSettings::default())
+    }
+
+    fn new_with_settings(pipeline: Arc<Pipeline>, runtime_settings: RuntimeSettings) -> Self {
         let next_request_id = Arc::new(AtomicU64::new(1));
         let next_connection_id = Arc::new(AtomicU64::new(1));
         let runtime_stats = Arc::new(RuntimeStatsRegistry::new());
         let dynamic_config_state = crate::dynamic_config::SharedDynamicConfigState::new();
         let operational_state = crate::health::SharedRuntimeOperationalState::new();
         let upstream_tls_client_config = default_upstream_tls_client_config();
+        let upstream_settings =
+            RuntimeUpstreamSettings::new(Arc::clone(&upstream_tls_client_config), runtime_settings);
 
         Self {
             http1: Http1Deps::new(
@@ -1452,7 +1696,7 @@ impl RuntimeDeps {
                 operational_state.clone(),
                 Arc::clone(&runtime_stats),
                 dynamic_config_state.clone(),
-                Arc::clone(&upstream_tls_client_config),
+                upstream_settings.clone(),
             ),
             http2: Http2Deps::new(
                 Arc::clone(&pipeline),
@@ -1461,6 +1705,7 @@ impl RuntimeDeps {
                 Arc::clone(&runtime_stats),
                 dynamic_config_state.clone(),
                 Arc::clone(&upstream_tls_client_config),
+                runtime_settings,
             ),
             http3: crate::http3::Http3RuntimeBoundaryDeps::new(Arc::clone(&pipeline)),
             dynamic_config_state,
@@ -2075,6 +2320,19 @@ impl Default for Http1UpstreamLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Http2UpstreamLimits {
+    max_body_bytes: usize,
+}
+
+impl Default for Http2UpstreamLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_UPSTREAM_MAX_BODY_BYTES,
+        }
+    }
+}
+
 fn serialize_http1_request_with_body_and_trailers(req: &mut HttpRequest) -> FpResult<Vec<u8>> {
     if !req.trailers.is_empty() {
         validate_http1_trailer_map(&req.trailers)?;
@@ -2211,6 +2469,8 @@ where
 
 async fn read_websocket_upgrade_response_async<S>(
     stream: &mut S,
+    limits: Http1UpstreamLimits,
+    timeout: std::time::Duration,
 ) -> FpResult<(HttpResponse, Vec<u8>)>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -2220,12 +2480,12 @@ where
 
     loop {
         if let Some(parsed) =
-            parse_websocket_upgrade_response_head(&buffer, DEFAULT_UPSTREAM_MAX_HEADER_BYTES)?
+            parse_websocket_upgrade_response_head(&buffer, limits.max_header_bytes)?
         {
             return Ok((parsed.response, parsed.remaining));
         }
 
-        let n = read_upstream_chunk(stream, &mut tmp, DEFAULT_UPSTREAM_READ_TIMEOUT).await?;
+        let n = read_upstream_chunk(stream, &mut tmp, timeout).await?;
         if n == 0 {
             return Err(FpError::invalid_protocol_data(
                 "WebSocket upstream response parse failed",
@@ -2544,9 +2804,16 @@ fn upstream_error_response(
         HeaderCase::Http1 => "Content-Length",
         HeaderCase::Http2 => "content-length",
     };
+    let date = match header_case {
+        HeaderCase::Http1 => "Date",
+        HeaderCase::Http2 => "date",
+    };
     response
         .headers
         .insert(content_length.to_string(), "0".to_string());
+    response
+        .headers
+        .insert(date.to_string(), current_http_date());
     if matches!(header_case, HeaderCase::Http1) {
         response
             .headers
@@ -2591,12 +2858,33 @@ where
         .map_err(|_| FpError::invalid_protocol_data("upstream write failed"))
 }
 
+async fn write_http2_frames_to_async<S>(
+    stream: &mut S,
+    frames: &[Http2Frame],
+    write_error_context: &str,
+) -> FpResult<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    for frame in frames {
+        let bytes = serialize_http2_frame(frame).map_err(|e| {
+            FpError::invalid_protocol_data(format!("HTTP/2 frame encode error: {e}"))
+        })?;
+        stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| FpError::internal(format!("{write_error_context}: {e}")))?;
+    }
+    Ok(())
+}
+
 async fn forward_http2_request_shared(
     mut lease: Http2StreamLease,
     request: &HttpRequest,
     authority: &str,
     scheme: &str,
     timeout: std::time::Duration,
+    limits: Http2UpstreamLimits,
 ) -> FpResult<HttpResponse> {
     let stream_id = lease.stream_id();
     let mut encoder =
@@ -2610,7 +2898,7 @@ async fn forward_http2_request_shared(
         lease.submit_frame(frame).await?;
     }
 
-    read_http2_response_from_shared_session(&mut lease, timeout).await
+    read_http2_response_from_shared_session(&mut lease, timeout, limits).await
 }
 
 fn encode_http2_request_frames(
@@ -2727,6 +3015,30 @@ fn encode_http2_request_frames(
     Ok(frames)
 }
 
+fn encode_http2_request_header_frame(
+    encoder: &mut fingerprint_proxy_hpack::Encoder,
+    stream_id: Http2StreamId,
+    request: &HttpRequest,
+    authority: &str,
+    scheme: &str,
+) -> FpResult<Http2Frame> {
+    if stream_id.is_connection() {
+        return Err(FpError::invalid_protocol_data(
+            "HTTP/2 request requires a non-zero stream id",
+        ));
+    }
+    let mut request_without_body = request.clone();
+    request_without_body.body.clear();
+    request_without_body.trailers.clear();
+    let mut frames =
+        encode_http2_request_frames(encoder, stream_id, &request_without_body, authority, scheme)?;
+    let mut frame = frames
+        .pop()
+        .ok_or_else(|| FpError::internal("HTTP/2 request header frame was not encoded"))?;
+    frame.header.flags = 0x4;
+    Ok(frame)
+}
+
 fn encode_http2_request_trailers(
     encoder: &mut fingerprint_proxy_hpack::Encoder,
     trailers: &std::collections::BTreeMap<String, String>,
@@ -2752,6 +3064,39 @@ fn encode_http2_request_trailers(
         encode_hpack_header(encoder, &mut out, name, value);
     }
     Ok(out)
+}
+
+fn encode_http2_response_header_fields_frame(
+    encoder: &mut fingerprint_proxy_hpack::Encoder,
+    stream_id: Http2StreamId,
+    fields: &[Http2HeaderField],
+    end_stream: bool,
+) -> FpResult<Http2Frame> {
+    if stream_id.is_connection() {
+        return Err(FpError::invalid_protocol_data(
+            "HTTP/2 response frames require a non-zero stream_id",
+        ));
+    }
+
+    let mut header_block = Vec::new();
+    for field in fields {
+        if field.name.is_empty() {
+            return Err(FpError::invalid_protocol_data(
+                "HTTP/2 response header name must be non-empty",
+            ));
+        }
+        encode_hpack_header(encoder, &mut header_block, &field.name, &field.value);
+    }
+
+    Ok(Http2Frame {
+        header: Http2FrameHeader {
+            length: header_block.len() as u32,
+            frame_type: Http2FrameType::Headers,
+            flags: if end_stream { 0x5 } else { 0x4 },
+            stream_id,
+        },
+        payload: Http2FramePayload::Headers(header_block),
+    })
 }
 
 fn encode_hpack_header(
@@ -2793,6 +3138,7 @@ fn validate_http2_regular_header_name(name: &str) -> FpResult<()> {
 async fn read_http2_response_from_shared_session(
     lease: &mut Http2StreamLease,
     timeout: std::time::Duration,
+    limits: Http2UpstreamLimits,
 ) -> FpResult<HttpResponse> {
     let mut response = HttpResponse {
         version: "HTTP/2".to_string(),
@@ -2829,7 +3175,7 @@ async fn read_http2_response_from_shared_session(
                         "HTTP/2 upstream DATA received before response headers",
                     ));
                 }
-                if response.body.len() + bytes.len() > DEFAULT_UPSTREAM_MAX_BODY_BYTES {
+                if response.body.len() + bytes.len() > limits.max_body_bytes {
                     return Err(FpError::invalid_protocol_data(
                         "upstream response body too large",
                     ));
@@ -3039,7 +3385,7 @@ impl Http1RouterDeps for Http1Deps {
             id: fingerprint_proxy_core::identifiers::VirtualHostId(v.id),
         });
         let bound_domain = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|snapshot| snapshot.config());
         let module_config = build_request_module_config(selected_vhost, bound_domain);
@@ -3079,13 +3425,18 @@ struct Http2Deps {
     fingerprinting_stats: FingerprintingStatsIntegration,
     connection_stats: ConnectionStatsIntegration,
     dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
-    bound_domain_snapshot: std::sync::OnceLock<
-        Arc<fingerprint_proxy_bootstrap_config::dynamic::atomic_update::DynamicConfigSnapshot>,
-    >,
+    bound_runtime_snapshot:
+        std::sync::OnceLock<Arc<crate::dynamic_config::RuntimeDynamicConfigSnapshot>>,
     upstream_connection_manager: UpstreamConnectionManager,
+    runtime_settings: RuntimeSettings,
     tls_sni: Option<String>,
     peer_addr: Option<SocketAddr>,
     local_addr: Option<SocketAddr>,
+    continued_tasks: JoinSet<FpResult<(Http2StreamId, HttpResponse)>>,
+    grpc_streaming_requests: BTreeMap<Http2StreamId, mpsc::Sender<GrpcStreamingRequestEvent>>,
+    grpc_streaming_response_tx: mpsc::Sender<FpResult<Http2StreamingResponseOwnerEvent>>,
+    grpc_streaming_response_rx: mpsc::Receiver<FpResult<Http2StreamingResponseOwnerEvent>>,
+    active_grpc_streaming_tasks: usize,
 }
 
 struct Http2SharedStreamAcquire {
@@ -3100,6 +3451,34 @@ enum Http2SharedSessionLeaseAttempt {
     Closed,
 }
 
+#[derive(Debug)]
+enum GrpcStreamingRequestEvent {
+    Data { bytes: Vec<u8>, end_stream: bool },
+    Trailers(std::collections::BTreeMap<String, String>),
+}
+
+#[derive(Debug)]
+enum Http2StreamingResponseOwnerEvent {
+    Headers {
+        stream_id: Http2StreamId,
+        fields: Vec<Http2HeaderField>,
+        end_stream: bool,
+    },
+    Data {
+        stream_id: Http2StreamId,
+        bytes: Vec<u8>,
+        end_stream: bool,
+    },
+    Done,
+}
+
+fn new_grpc_streaming_response_channel() -> (
+    mpsc::Sender<FpResult<Http2StreamingResponseOwnerEvent>>,
+    mpsc::Receiver<FpResult<Http2StreamingResponseOwnerEvent>>,
+) {
+    mpsc::channel(128)
+}
+
 impl Http2Deps {
     fn new(
         pipeline: Arc<Pipeline>,
@@ -3108,8 +3487,11 @@ impl Http2Deps {
         runtime_stats: Arc<RuntimeStatsRegistry>,
         dynamic_config_state: crate::dynamic_config::SharedDynamicConfigState,
         upstream_tls_client_config: Arc<rustls::ClientConfig>,
+        runtime_settings: RuntimeSettings,
     ) -> Self {
         let connection_id = ConnectionId(next_connection_id.fetch_add(1, Ordering::Relaxed));
+        let (grpc_streaming_response_tx, grpc_streaming_response_rx) =
+            new_grpc_streaming_response_channel();
         Self {
             pipeline,
             decoder: fingerprint_proxy_hpack::Decoder::new(
@@ -3131,15 +3513,26 @@ impl Http2Deps {
             fingerprinting_stats: FingerprintingStatsIntegration::new(Arc::clone(&runtime_stats)),
             connection_stats: connection_stats_integration(runtime_stats),
             dynamic_config_state,
-            bound_domain_snapshot: std::sync::OnceLock::new(),
-            upstream_connection_manager: UpstreamConnectionManager::new(upstream_tls_client_config),
+            bound_runtime_snapshot: std::sync::OnceLock::new(),
+            upstream_connection_manager: UpstreamConnectionManager::new_with_connect_timeout(
+                upstream_tls_client_config,
+                runtime_settings.upstream_connect_timeout,
+            ),
+            runtime_settings,
             tls_sni: None,
             peer_addr: None,
             local_addr: None,
+            continued_tasks: JoinSet::new(),
+            grpc_streaming_requests: BTreeMap::new(),
+            grpc_streaming_response_tx,
+            grpc_streaming_response_rx,
+            active_grpc_streaming_tasks: 0,
         }
     }
 
     fn clone_for_connection(&self) -> Self {
+        let (grpc_streaming_response_tx, grpc_streaming_response_rx) =
+            new_grpc_streaming_response_channel();
         Self {
             pipeline: Arc::clone(&self.pipeline),
             decoder: fingerprint_proxy_hpack::Decoder::new(
@@ -3161,20 +3554,70 @@ impl Http2Deps {
             fingerprinting_stats: self.fingerprinting_stats.clone(),
             connection_stats: self.connection_stats.clone(),
             dynamic_config_state: self.dynamic_config_state.clone(),
-            bound_domain_snapshot: std::sync::OnceLock::new(),
+            bound_runtime_snapshot: std::sync::OnceLock::new(),
             upstream_connection_manager: self.upstream_connection_manager.clone(),
+            runtime_settings: self.runtime_settings,
             tls_sni: None,
             peer_addr: None,
             local_addr: None,
+            continued_tasks: JoinSet::new(),
+            grpc_streaming_requests: BTreeMap::new(),
+            grpc_streaming_response_tx,
+            grpc_streaming_response_rx,
+            active_grpc_streaming_tasks: 0,
         }
     }
 
-    fn ensure_domain_config_loaded(&self) -> FpResult<()> {
-        if self.bound_domain_snapshot.get().is_some() {
+    fn clone_for_continued_task(&self) -> Self {
+        let bound_runtime_snapshot = std::sync::OnceLock::new();
+        if let Some(snapshot) = self.bound_runtime_snapshot.get() {
+            let _ = bound_runtime_snapshot.set(Arc::clone(snapshot));
+        }
+
+        let (_unused_tx, grpc_streaming_response_rx) = new_grpc_streaming_response_channel();
+        Self {
+            pipeline: Arc::clone(&self.pipeline),
+            decoder: fingerprint_proxy_hpack::Decoder::new(
+                fingerprint_proxy_hpack::DecoderConfig {
+                    max_dynamic_table_size: 4096,
+                },
+            ),
+            encoder: fingerprint_proxy_hpack::Encoder::new(
+                fingerprint_proxy_hpack::EncoderConfig {
+                    max_dynamic_table_size: 4096,
+                    use_huffman: false,
+                },
+            ),
+            next_request_id: Arc::clone(&self.next_request_id),
+            next_connection_id: Arc::clone(&self.next_connection_id),
+            connection_id: self.connection_id,
+            runtime_fingerprinting_result: self.runtime_fingerprinting_result.clone(),
+            runtime_stats: Arc::clone(&self.runtime_stats),
+            fingerprinting_stats: self.fingerprinting_stats.clone(),
+            connection_stats: self.connection_stats.clone(),
+            dynamic_config_state: self.dynamic_config_state.clone(),
+            bound_runtime_snapshot,
+            upstream_connection_manager: self.upstream_connection_manager.clone(),
+            runtime_settings: self.runtime_settings,
+            tls_sni: self.tls_sni.clone(),
+            peer_addr: self.peer_addr,
+            local_addr: self.local_addr,
+            continued_tasks: JoinSet::new(),
+            grpc_streaming_requests: BTreeMap::new(),
+            grpc_streaming_response_tx: self.grpc_streaming_response_tx.clone(),
+            grpc_streaming_response_rx,
+            active_grpc_streaming_tasks: 0,
+        }
+    }
+
+    fn bind_runtime_snapshot_from_http1(&self, http1: &Http1Deps) -> FpResult<()> {
+        if self.bound_runtime_snapshot.get().is_some() {
             return Ok(());
         }
-        let snapshot = self.dynamic_config_state.active_snapshot()?;
-        let _ = self.bound_domain_snapshot.set(snapshot);
+        let snapshot = http1
+            .bound_runtime_snapshot()
+            .ok_or_else(|| FpError::internal("HTTP/1 runtime snapshot is not bound"))?;
+        let _ = self.bound_runtime_snapshot.set(snapshot);
         Ok(())
     }
 
@@ -3186,12 +3629,11 @@ impl Http2Deps {
         self.dynamic_config_state
             .replace_active_domain_config_for_tests(domain_config.clone())
             .expect("set test dynamic state");
-        let snapshot = Arc::new(
-            fingerprint_proxy_bootstrap_config::dynamic::atomic_update::DynamicConfigSnapshot::from_domain_config(
-                domain_config,
-            ),
-        );
-        let _ = self.bound_domain_snapshot.set(snapshot);
+        let snapshot = self
+            .dynamic_config_state
+            .active_snapshot()
+            .expect("test runtime snapshot");
+        let _ = self.bound_runtime_snapshot.set(snapshot);
     }
 
     #[cfg(test)]
@@ -3238,7 +3680,7 @@ impl Http2Deps {
     fn selected_virtual_host(
         &self,
     ) -> Option<&fingerprint_proxy_bootstrap_config::config::VirtualHostConfig> {
-        let domain = self.bound_domain_snapshot.get()?.config();
+        let domain = self.bound_runtime_snapshot.get()?.config();
         select_virtual_host(domain, self.tls_sni.as_deref(), self.local_addr)
     }
 
@@ -3414,7 +3856,7 @@ impl Http2Deps {
         ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http2)?;
 
         let domain = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|s| s.config())
             .ok_or_else(|| {
@@ -3436,6 +3878,9 @@ impl Http2Deps {
                 response
                     .headers
                     .insert("content-length".to_string(), "0".to_string());
+                response
+                    .headers
+                    .insert("date".to_string(), current_http_date());
                 ctx.response = response;
                 self.pipeline
                     .execute(&mut ctx, ProcessingStage::Response)
@@ -3515,7 +3960,8 @@ impl Http2Deps {
             &upstream_req,
             &vhost.upstream.host,
             scheme,
-            DEFAULT_UPSTREAM_READ_TIMEOUT,
+            self.runtime_settings.upstream_request_timeout,
+            self.runtime_settings.http2_upstream_limits,
         )
         .await
         {
@@ -3546,6 +3992,242 @@ impl Http2Deps {
             .map_err(|e| e.error)?;
         Ok(ctx.response)
     }
+
+    async fn forward_grpc_http2_streaming(
+        &self,
+        downstream_stream_id: Http2StreamId,
+        mut ctx: RequestContext,
+        mut request_rx: mpsc::Receiver<GrpcStreamingRequestEvent>,
+    ) -> FpResult<()> {
+        ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http2)?;
+
+        let domain = self
+            .bound_runtime_snapshot
+            .get()
+            .map(|s| s.config())
+            .ok_or_else(|| {
+                FpError::internal("domain config is missing for gRPC HTTP/2 streaming forwarding")
+            })?;
+
+        let vhost = select_virtual_host(
+            domain,
+            self.tls_sni.as_deref(),
+            Some(ctx.connection.destination_addr),
+        )
+        .ok_or_else(|| {
+            FpError::invalid_protocol_data("gRPC HTTP/2 streaming route requires a virtual host")
+        })?;
+
+        let selected_upstream_app_protocol = select_upstream_protocol_for_client(
+            ClientAppProtocol::Http2,
+            &SelectionInput {
+                allowed_upstream_app_protocols: vhost
+                    .upstream
+                    .allowed_upstream_app_protocols
+                    .as_deref(),
+            },
+        )?;
+        if selected_upstream_app_protocol != UpstreamAppProtocol::Http2 {
+            return Err(FpError::invalid_protocol_data(
+                "gRPC HTTP/2 streaming forwarding requires HTTP/2 upstream app protocol",
+            ));
+        }
+
+        let upstream_req = prepare_grpc_http2_request(&ctx.request)?;
+        let transport = match vhost.upstream.protocol {
+            fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Http => {
+                UpstreamTransportMode::Http
+            }
+            fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Https => {
+                UpstreamTransportMode::Https
+            }
+        };
+        let scheme = match vhost.upstream.protocol {
+            fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Http => "http",
+            fingerprint_proxy_bootstrap_config::config::UpstreamProtocol::Https => "https",
+        };
+
+        let acquired = self
+            .acquire_http2_shared_stream(&vhost.upstream.host, vhost.upstream.port, transport)
+            .await?;
+        self.record_pooling_event(if acquired.reused {
+            PoolingEvent::Http2AcquireStreamHit
+        } else {
+            PoolingEvent::Http2AcquireStreamMiss
+        });
+
+        let mut lease = acquired.lease;
+        let upstream_stream_id = lease.stream_id();
+        let mut request_encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        let headers = encode_http2_request_header_frame(
+            &mut request_encoder,
+            upstream_stream_id,
+            &upstream_req,
+            &vhost.upstream.host,
+            scheme,
+        )?;
+        lease.submit_frame(headers).await?;
+
+        let response_tx = self.grpc_streaming_response_tx.clone();
+        let mut request_done = false;
+        let mut response_done = false;
+        while !request_done || !response_done {
+            tokio::select! {
+                request_event = request_rx.recv(), if !request_done => {
+                    match request_event {
+                        Some(GrpcStreamingRequestEvent::Data { bytes, end_stream }) => {
+                            let frame = Http2Frame {
+                                header: Http2FrameHeader {
+                                    length: bytes.len() as u32,
+                                    frame_type: Http2FrameType::Data,
+                                    flags: if end_stream { 0x1 } else { 0 },
+                                    stream_id: upstream_stream_id,
+                                },
+                                payload: Http2FramePayload::Data(bytes),
+                            };
+                            lease.submit_frame(frame).await?;
+                            request_done = end_stream;
+                        }
+                        Some(GrpcStreamingRequestEvent::Trailers(trailers)) => {
+                            let trailer_block = encode_http2_request_trailers(
+                                &mut request_encoder,
+                                &trailers,
+                            )?;
+                            let frame = Http2Frame {
+                                header: Http2FrameHeader {
+                                    length: trailer_block.len() as u32,
+                                    frame_type: Http2FrameType::Headers,
+                                    flags: 0x5,
+                                    stream_id: upstream_stream_id,
+                                },
+                                payload: Http2FramePayload::Headers(trailer_block),
+                            };
+                            lease.submit_frame(frame).await?;
+                            request_done = true;
+                        }
+                        None => request_done = true,
+                    }
+                }
+                response_event = lease.recv_response_event(), if !response_done => {
+                    match response_event {
+                        Some(Ok(Http2ResponseEvent::Headers { fields, end_stream })) => {
+                            response_tx.send(Ok(Http2StreamingResponseOwnerEvent::Headers {
+                                stream_id: downstream_stream_id,
+                                fields,
+                                end_stream,
+                            })).await.map_err(|_| FpError::internal("HTTP/2 owner streaming response channel closed"))?;
+                            response_done = end_stream;
+                        }
+                        Some(Ok(Http2ResponseEvent::Data { bytes, end_stream })) => {
+                            response_tx.send(Ok(Http2StreamingResponseOwnerEvent::Data {
+                                stream_id: downstream_stream_id,
+                                bytes,
+                                end_stream,
+                            })).await.map_err(|_| FpError::internal("HTTP/2 owner streaming response channel closed"))?;
+                            response_done = end_stream;
+                        }
+                        Some(Ok(Http2ResponseEvent::RstStream { .. })) => {
+                            return Err(FpError::invalid_protocol_data("upstream HTTP/2 stream reset"));
+                        }
+                        Some(Err(err)) => return Err(err),
+                        None => {
+                            return Err(FpError::invalid_protocol_data(
+                                "upstream HTTP/2 response ended before END_STREAM",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        ctx.response.version = "HTTP/2".to_string();
+        Ok(())
+    }
+
+    fn has_continued_tasks(&self) -> bool {
+        !self.continued_tasks.is_empty() || self.active_grpc_streaming_tasks != 0
+    }
+
+    async fn next_continued_response_frames(&mut self) -> FpResult<Option<Vec<Http2Frame>>> {
+        enum ContinuedOwnerEvent {
+            Buffered(FpResult<(Http2StreamId, HttpResponse)>),
+            Streaming(FpResult<Http2StreamingResponseOwnerEvent>),
+        }
+
+        loop {
+            if self.continued_tasks.is_empty() && self.active_grpc_streaming_tasks == 0 {
+                return Ok(None);
+            }
+
+            let event = tokio::select! {
+                joined = self.continued_tasks.join_next(), if !self.continued_tasks.is_empty() => {
+                    let Some(joined) = joined else {
+                        continue;
+                    };
+                    ContinuedOwnerEvent::Buffered(match joined {
+                        Ok(result) => result,
+                        Err(_) => Err(FpError::internal("HTTP/2 continued task panicked")),
+                    })
+                }
+                streaming = self.grpc_streaming_response_rx.recv(), if self.active_grpc_streaming_tasks != 0 => {
+                    let Some(streaming) = streaming else {
+                        return Err(FpError::internal("HTTP/2 owner streaming response channel closed"));
+                    };
+                    ContinuedOwnerEvent::Streaming(streaming)
+                }
+            };
+
+            match event {
+                ContinuedOwnerEvent::Buffered(result) => {
+                    let (stream_id, response) = result?;
+                    return fingerprint_proxy_http2::encode_http2_response_frames(
+                        &mut self.encoder,
+                        stream_id,
+                        &response,
+                    )
+                    .map(Some);
+                }
+                ContinuedOwnerEvent::Streaming(result) => match result? {
+                    Http2StreamingResponseOwnerEvent::Headers {
+                        stream_id,
+                        fields,
+                        end_stream,
+                    } => {
+                        return encode_http2_response_header_fields_frame(
+                            &mut self.encoder,
+                            stream_id,
+                            &fields,
+                            end_stream,
+                        )
+                        .map(|frame| Some(vec![frame]));
+                    }
+                    Http2StreamingResponseOwnerEvent::Data {
+                        stream_id,
+                        bytes,
+                        end_stream,
+                    } => {
+                        return Ok(Some(vec![Http2Frame {
+                            header: Http2FrameHeader {
+                                length: bytes.len() as u32,
+                                frame_type: Http2FrameType::Data,
+                                flags: if end_stream { 0x1 } else { 0 },
+                                stream_id,
+                            },
+                            payload: Http2FramePayload::Data(bytes),
+                        }]));
+                    }
+                    Http2StreamingResponseOwnerEvent::Done => {
+                        self.active_grpc_streaming_tasks =
+                            self.active_grpc_streaming_tasks.saturating_sub(1);
+                    }
+                },
+            }
+        }
+    }
 }
 
 impl Http2RouterDeps for Http2Deps {
@@ -3567,7 +4249,7 @@ impl Http2RouterDeps for Http2Deps {
             id: fingerprint_proxy_core::identifiers::VirtualHostId(v.id),
         });
         let bound_domain = self
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
             .map(|snapshot| snapshot.config());
         let module_config = build_request_module_config(selected_vhost, bound_domain);
@@ -3586,12 +4268,104 @@ impl Http2RouterDeps for Http2Deps {
         Ok(pre)
     }
 
-    fn handle_continued<'a>(
+    fn spawn_continued(&mut self, stream_id: Http2StreamId, ctx: RequestContext) -> FpResult<()> {
+        let deps = self.clone_for_continued_task();
+        self.continued_tasks.spawn(async move {
+            deps.forward_http2_continued(ctx)
+                .await
+                .map(|response| (stream_id, response))
+        });
+        Ok(())
+    }
+
+    fn try_start_grpc_streaming<'a>(
         &'a mut self,
-        ctx: RequestContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FpResult<HttpResponse>> + Send + 'a>>
-    {
-        Box::pin(async move { self.forward_http2_continued(ctx).await })
+        stream_id: Http2StreamId,
+        request: HttpRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = FpResult<GrpcStreamingStart>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if !grpc_http2_request_requires_transparent_forwarding(&request) {
+                return Ok(GrpcStreamingStart::NotStreaming);
+            }
+
+            let pre = self.build_prepipeline_input(request)?;
+            match run_prepared_pipeline(&pre, self.pipeline())? {
+                OrchestrationOutcome::Stopped { response, .. } => {
+                    let frames = fingerprint_proxy_http2::encode_http2_response_frames(
+                        &mut self.encoder,
+                        stream_id,
+                        &response,
+                    )?;
+                    Ok(GrpcStreamingStart::Responded(frames))
+                }
+                OrchestrationOutcome::Continued { ctx, .. } => {
+                    let (request_tx, request_rx) = mpsc::channel(32);
+                    self.grpc_streaming_requests.insert(stream_id, request_tx);
+                    self.active_grpc_streaming_tasks += 1;
+                    let deps = self.clone_for_continued_task();
+                    let owner_tx = self.grpc_streaming_response_tx.clone();
+                    tokio::spawn(async move {
+                        let result = deps
+                            .forward_grpc_http2_streaming(stream_id, *ctx, request_rx)
+                            .await;
+                        if let Err(err) = result {
+                            let _ = owner_tx.send(Err(err)).await;
+                        }
+                        let _ = owner_tx
+                            .send(Ok(Http2StreamingResponseOwnerEvent::Done))
+                            .await;
+                    });
+                    Ok(GrpcStreamingStart::Started)
+                }
+            }
+        })
+    }
+
+    fn submit_grpc_stream_data<'a>(
+        &'a mut self,
+        stream_id: Http2StreamId,
+        bytes: Vec<u8>,
+        end_stream: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FpResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(tx) = self.grpc_streaming_requests.get(&stream_id) else {
+                return Err(FpError::invalid_protocol_data(
+                    "gRPC HTTP/2 streaming request is not active",
+                ));
+            };
+            tx.send(GrpcStreamingRequestEvent::Data { bytes, end_stream })
+                .await
+                .map_err(|_| {
+                    FpError::invalid_protocol_data("gRPC HTTP/2 streaming request channel closed")
+                })?;
+            if end_stream {
+                self.grpc_streaming_requests.remove(&stream_id);
+            }
+            Ok(())
+        })
+    }
+
+    fn submit_grpc_stream_trailers<'a>(
+        &'a mut self,
+        stream_id: Http2StreamId,
+        trailers: std::collections::BTreeMap<String, String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FpResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(tx) = self.grpc_streaming_requests.get(&stream_id) else {
+                return Err(FpError::invalid_protocol_data(
+                    "gRPC HTTP/2 streaming request is not active",
+                ));
+            };
+            tx.send(GrpcStreamingRequestEvent::Trailers(trailers))
+                .await
+                .map_err(|_| {
+                    FpError::invalid_protocol_data("gRPC HTTP/2 streaming request channel closed")
+                })?;
+            self.grpc_streaming_requests.remove(&stream_id);
+            Ok(())
+        })
     }
 }
 
@@ -3663,7 +4437,7 @@ impl ResolvesServerCert for StaticCertifiedKeyResolver {
 }
 
 #[derive(Debug)]
-struct RuntimeTlsMaterial {
+pub(crate) struct RuntimeTlsMaterial {
     default_config: Arc<ServerConfig>,
     keys_by_id: Arc<BTreeMap<CertificateId, Arc<CertifiedKey>>>,
 }
@@ -3673,14 +4447,9 @@ pub(crate) struct PreparedRuntimeTlsServerConfigs {
     material: Arc<RuntimeTlsMaterial>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RuntimeTlsServerConfigActivation {
-    previous_active: Arc<RuntimeTlsMaterial>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeTlsServerConfigs {
-    active: Arc<RwLock<Arc<RuntimeTlsMaterial>>>,
+    material: Arc<RuntimeTlsMaterial>,
 }
 
 impl RuntimeTlsServerConfigs {
@@ -3690,8 +4459,54 @@ impl RuntimeTlsServerConfigs {
     ) -> FpResult<Self> {
         let material = Self::build_material(selection, keys_by_id)?;
         Ok(Self {
-            active: Arc::new(RwLock::new(Arc::new(material))),
+            material: Arc::new(material),
         })
+    }
+
+    pub(crate) fn current_material(&self) -> Arc<RuntimeTlsMaterial> {
+        Arc::clone(&self.material)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_material() -> Arc<RuntimeTlsMaterial> {
+        use fingerprint_proxy_tls_termination::config::{
+            CertificateRef as TlsCertificateRef,
+            DefaultCertificatePolicy as TlsDefaultCertificatePolicy,
+            ServerNamePattern as TlsServerNamePattern, TlsCertificateEntry,
+        };
+        use rustls::crypto::ring::sign::any_supported_type;
+
+        let mut params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()]);
+        params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        let cert = rcgen::Certificate::from_params(params).expect("test cert");
+        let cert_pem = cert.serialize_pem().expect("test cert pem");
+        let key_pem = cert.serialize_private_key_pem();
+
+        let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test cert");
+        let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .expect("parse test key")
+            .expect("test key");
+        let signing_key = any_supported_type(&key).expect("supported test key");
+        let cert_id = CertificateId::new("test-cert").expect("test cert id");
+        let mut keys_by_id = BTreeMap::new();
+        keys_by_id.insert(
+            cert_id.clone(),
+            Arc::new(CertifiedKey::new(certs, signing_key)),
+        );
+        let selection = TlsSelectionConfig {
+            default_policy: TlsDefaultCertificatePolicy::UseDefault(TlsCertificateRef {
+                id: cert_id.clone(),
+            }),
+            certificates: vec![TlsCertificateEntry {
+                certificate: TlsCertificateRef { id: cert_id },
+                server_names: vec![TlsServerNamePattern::Exact("test.example.com".to_string())],
+            }],
+        };
+        Arc::new(Self::build_material(selection, keys_by_id).expect("test TLS material"))
     }
 
     pub(crate) fn prepare_update(
@@ -3703,38 +4518,12 @@ impl RuntimeTlsServerConfigs {
         })
     }
 
-    pub(crate) fn apply_prepared(
-        &self,
-        prepared: PreparedRuntimeTlsServerConfigs,
-    ) -> FpResult<RuntimeTlsServerConfigActivation> {
-        let mut guard = self
-            .active
-            .write()
-            .map_err(|_| runtime_tls_material_lock_poisoned_error("write"))?;
-        let previous_active = Arc::clone(&guard);
-        *guard = prepared.material;
-        Ok(RuntimeTlsServerConfigActivation { previous_active })
-    }
-
-    pub(crate) fn restore_previous(
-        &self,
-        activation: RuntimeTlsServerConfigActivation,
-    ) -> FpResult<()> {
-        let mut guard = self
-            .active
-            .write()
-            .map_err(|_| runtime_tls_material_lock_poisoned_error("write"))?;
-        *guard = activation.previous_active;
-        Ok(())
-    }
-
-    pub(crate) fn server_config_for_connection(
-        &self,
+    pub(crate) fn server_config_for_connection_from_material(
+        material: Arc<RuntimeTlsMaterial>,
         domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
         sni: Option<&str>,
         destination: Option<SocketAddr>,
     ) -> FpResult<Arc<ServerConfig>> {
-        let material = self.active_material()?;
         let Some(vhost) = select_virtual_host(domain, sni, destination) else {
             return Ok(Arc::clone(&material.default_config));
         };
@@ -3743,20 +4532,26 @@ impl RuntimeTlsServerConfigs {
     }
 
     #[cfg(test)]
+    pub(crate) fn server_config_for_connection(
+        &self,
+        domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
+        sni: Option<&str>,
+        destination: Option<SocketAddr>,
+    ) -> FpResult<Arc<ServerConfig>> {
+        Self::server_config_for_connection_from_material(
+            self.current_material(),
+            domain,
+            sni,
+            destination,
+        )
+    }
+
+    #[cfg(test)]
     fn build_vhost_server_config(
         &self,
         vhost: &fingerprint_proxy_bootstrap_config::config::VirtualHostConfig,
     ) -> FpResult<Arc<ServerConfig>> {
-        let material = self.active_material()?;
-        Self::build_vhost_server_config_from_material(&material, vhost)
-    }
-
-    fn active_material(&self) -> FpResult<Arc<RuntimeTlsMaterial>> {
-        let guard = self
-            .active
-            .read()
-            .map_err(|_| runtime_tls_material_lock_poisoned_error("read"))?;
-        Ok(Arc::clone(&guard))
+        Self::build_vhost_server_config_from_material(&self.material, vhost)
     }
 
     fn build_material(
@@ -3810,9 +4605,16 @@ impl RuntimeTlsServerConfigs {
         &self,
         cert_id: &str,
     ) -> FpResult<rustls::pki_types::CertificateDer<'static>> {
+        Self::certificate_der_from_material_for_test(self.current_material(), cert_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn certificate_der_from_material_for_test(
+        material: Arc<RuntimeTlsMaterial>,
+        cert_id: &str,
+    ) -> FpResult<rustls::pki_types::CertificateDer<'static>> {
         let certificate_id =
             CertificateId::new(cert_id.to_string()).map_err(FpError::invalid_configuration)?;
-        let material = self.active_material()?;
         material
             .keys_by_id
             .get(&certificate_id)
@@ -3828,17 +4630,17 @@ impl RuntimeTlsServerConfigs {
     #[cfg(test)]
     fn active_default_alpn_protocols_for_test(&self) -> FpResult<Vec<Vec<u8>>> {
         Ok(self
-            .active_material()?
+            .current_material()
             .default_config
             .alpn_protocols
             .clone())
     }
 }
 
-fn runtime_tls_material_lock_poisoned_error(operation: &str) -> FpError {
-    FpError::internal(format!(
-        "runtime TLS material store {operation} lock is poisoned"
-    ))
+impl PreparedRuntimeTlsServerConfigs {
+    pub(crate) fn into_material(self) -> Arc<RuntimeTlsMaterial> {
+        self.material
+    }
 }
 
 fn alpn_protocols_for_vhost_policy(
@@ -3915,11 +4717,13 @@ mod tests {
     use fingerprint_proxy_bootstrap_config::config::{
         BootstrapConfig, CertificateRef as BootstrapCertificateRef, CertificateRef,
         DefaultCertificatePolicy as BootstrapDefaultCertificatePolicy, DomainConfig,
-        FingerprintHeaderConfig, ListenerAcquisitionMode,
-        ListenerConfig as BootstrapListenerConfig, ServerNamePattern as BootstrapServerNamePattern,
-        ServerNamePattern, TlsCertificateConfig as BootstrapTlsCertificateConfig,
-        TlsMinimumVersion, UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
-        VirtualHostProtocolConfig, VirtualHostTlsConfig,
+        FingerprintHeaderConfig, FingerprintingConfig, Http2ServerPushPolicy,
+        ListenerAcquisitionMode, ListenerConfig as BootstrapListenerConfig,
+        ServerNamePattern as BootstrapServerNamePattern, ServerNamePattern,
+        TlsCertificateConfig as BootstrapTlsCertificateConfig, TlsMinimumVersion,
+        TlsPrivateKeyFileProviderConfig, TlsPrivateKeyProviderConfig, UpstreamConfig,
+        UpstreamProtocol, VirtualHostConfig, VirtualHostMatch, VirtualHostProtocolConfig,
+        VirtualHostTlsConfig,
     };
     use fingerprint_proxy_core::fingerprinting::Ja4OneComponentName;
     use fingerprint_proxy_core::identifiers::ConfigVersion;
@@ -3928,6 +4732,12 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    fn file_private_key_provider(path: impl Into<String>) -> TlsPrivateKeyProviderConfig {
+        TlsPrivateKeyProviderConfig::File(TlsPrivateKeyFileProviderConfig {
+            pem_path: path.into(),
+        })
+    }
     use tokio::sync::oneshot;
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -4172,6 +4982,8 @@ mod tests {
         fn bootstrap_config(&self) -> BootstrapConfig {
             BootstrapConfig {
                 listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+                enable_http3_quic_listeners: false,
+                fingerprinting: FingerprintingConfig::default(),
                 listeners: vec![BootstrapListenerConfig {
                     bind: "127.0.0.1:0".parse().expect("bind"),
                 }],
@@ -4179,13 +4991,17 @@ mod tests {
                     BootstrapTlsCertificateConfig {
                         id: "default".to_string(),
                         certificate_pem_path: self.default_cert_path.to_string_lossy().to_string(),
-                        private_key_pem_path: self.default_key_path.to_string_lossy().to_string(),
+                        private_key_provider: file_private_key_provider(
+                            self.default_key_path.to_string_lossy().to_string(),
+                        ),
                         server_names: Vec::new(),
                     },
                     BootstrapTlsCertificateConfig {
                         id: "example".to_string(),
                         certificate_pem_path: self.example_cert_path.to_string_lossy().to_string(),
-                        private_key_pem_path: self.example_key_path.to_string_lossy().to_string(),
+                        private_key_provider: file_private_key_provider(
+                            self.example_key_path.to_string_lossy().to_string(),
+                        ),
                         server_names: vec![BootstrapServerNamePattern::Exact(
                             "example.com".to_string(),
                         )],
@@ -4216,6 +5032,138 @@ mod tests {
                 module_enabled: BTreeMap::new(),
             }
         }
+    }
+
+    #[test]
+    fn runtime_settings_use_bootstrap_timeouts_and_limits_with_current_defaults() {
+        let pki = TestPki::generate();
+        let mut bootstrap = pki.bootstrap_config();
+        bootstrap.timeouts.upstream_connect_timeout = Some(Duration::from_millis(11));
+        bootstrap.timeouts.request_timeout = Some(Duration::from_millis(12));
+        bootstrap.limits.max_header_bytes = Some(1234);
+        bootstrap.limits.max_body_bytes = Some(5678);
+
+        let settings = RuntimeSettings::from_bootstrap(&bootstrap);
+
+        assert_eq!(
+            settings.upstream_connect_timeout,
+            Some(Duration::from_millis(11))
+        );
+        assert_eq!(settings.upstream_request_timeout, Duration::from_millis(12));
+        assert_eq!(settings.http1_client_limits.max_header_bytes, 1234);
+        assert_eq!(settings.http1_client_limits.max_body_bytes, 5678);
+        assert_eq!(settings.http1_upstream_limits.max_header_bytes, 1234);
+        assert_eq!(settings.http1_upstream_limits.max_body_bytes, 5678);
+        assert_eq!(settings.http2_upstream_limits.max_body_bytes, 5678);
+        assert_eq!(
+            settings.websocket_proxy_limits.max_frame_payload_bytes,
+            5678
+        );
+
+        let defaults = RuntimeSettings::from_bootstrap(&pki.bootstrap_config());
+        assert_eq!(
+            defaults.http1_client_limits.max_header_bytes,
+            Http1ClientLimits::default().max_header_bytes
+        );
+        assert_eq!(
+            defaults.http1_upstream_limits.max_header_bytes,
+            DEFAULT_UPSTREAM_MAX_HEADER_BYTES
+        );
+        assert_eq!(
+            defaults.http1_upstream_limits.max_body_bytes,
+            DEFAULT_UPSTREAM_MAX_BODY_BYTES
+        );
+        assert_eq!(
+            defaults.websocket_proxy_limits.max_frame_payload_bytes,
+            fingerprint_proxy_websocket::DEFAULT_MAX_FRAME_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            defaults.upstream_request_timeout,
+            DEFAULT_UPSTREAM_READ_TIMEOUT
+        );
+        assert_eq!(defaults.upstream_connect_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_header_limit_drives_http1_client_runtime_path() {
+        let pki = TestPki::generate();
+        let mut bootstrap = pki.bootstrap_config();
+        bootstrap.limits.max_header_bytes = Some(32);
+        let settings = RuntimeSettings::from_bootstrap(&bootstrap);
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let mut deps = RuntimeDeps::new_with_settings(pipeline, settings);
+        let mut dispatcher =
+            TlsEntryDispatcher::with_http1_limits(deps.http1.runtime_settings.http1_client_limits);
+        let output = dispatcher
+            .dispatch(
+                Some(&NegotiatedAlpn::Http1),
+                DispatcherInput::Http1(
+                    fingerprint_proxy_http1_orchestrator::AssemblerInput::Bytes(
+                        b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Limit: too-large\r\n\r\n",
+                    ),
+                ),
+                &mut deps,
+            )
+            .await
+            .expect("client limit response");
+
+        let DispatcherOutput::Http1CloseAfterResponses(responses) = output else {
+            panic!("expected close-after client error response");
+        };
+        let response = parse_http1_response(&responses[0], Http1ParseOptions::default())
+            .expect("parse client error");
+        assert_eq!(response.status, Some(431));
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_limits_drive_http1_upstream_response_path() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            server
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nX-Limit: header-value-exceeds-config\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write upstream response");
+        });
+
+        let err = read_http1_response_async(
+            &mut client,
+            Http1UpstreamLimits {
+                max_header_bytes: 32,
+                max_body_bytes: DEFAULT_UPSTREAM_MAX_BODY_BYTES,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("configured upstream header limit");
+        assert_eq!(err.message, "upstream response headers too large");
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_limits_drive_websocket_upstream_handshake_path() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Limit: header-value-exceeds-config\r\n\r\n",
+                )
+                .await
+                .expect("write websocket response");
+        });
+
+        let err = read_websocket_upgrade_response_async(
+            &mut client,
+            Http1UpstreamLimits {
+                max_header_bytes: 32,
+                max_body_bytes: DEFAULT_UPSTREAM_MAX_BODY_BYTES,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("configured websocket handshake limit");
+        assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
     }
 
     async fn run_server_once() -> (SocketAddr, oneshot::Receiver<FpResult<()>>, TestPki) {
@@ -4260,19 +5208,17 @@ mod tests {
 
         let pipeline = Arc::new(pipeline);
         let mut deps = RuntimeDeps::new(pipeline);
-        deps.http1.set_domain_config(domain_config.clone());
-        deps.http2.set_domain_config(domain_config);
+        deps.dynamic_config_state
+            .replace_active_runtime_snapshot_for_tests(
+                domain_config,
+                tls_server_configs.current_material(),
+            )
+            .expect("seed runtime snapshot");
 
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.expect("accept");
-            let res = handle_connection_with_read_buf_size(
-                tcp,
-                tls_server_configs,
-                &mut deps,
-                read_buf_size,
-            )
-            .await;
+            let res = handle_connection_with_read_buf_size(tcp, &mut deps, read_buf_size).await;
             let _ = tx.send(res);
         });
 
@@ -4316,19 +5262,17 @@ mod tests {
 
         let pipeline = Arc::new(pipeline);
         let mut deps = RuntimeDeps::new(pipeline);
-        deps.http1.set_domain_config(domain_config.clone());
-        deps.http2.set_domain_config(domain_config);
+        deps.dynamic_config_state
+            .replace_active_runtime_snapshot_for_tests(
+                domain_config,
+                tls_server_configs.current_material(),
+            )
+            .expect("seed runtime snapshot");
 
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.expect("accept");
-            let res = handle_connection_with_read_buf_size(
-                tcp,
-                tls_server_configs,
-                &mut deps,
-                read_buf_size,
-            )
-            .await;
+            let res = handle_connection_with_read_buf_size(tcp, &mut deps, read_buf_size).await;
             let _ = tx.send(res);
         });
 
@@ -4430,12 +5374,12 @@ bind = "127.0.0.2:0"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{default_cert}"
-private_key_pem_path = "{default_key}"
+private_key_provider = {{ kind = "file", pem_path = "{default_key}" }}
 
 [[tls_certificates]]
 id = "example"
 certificate_pem_path = "{example_cert}"
-private_key_pem_path = "{example_key}"
+private_key_provider = {{ kind = "file", pem_path = "{example_key}" }}
 server_names = [{{ kind = "exact", value = "example.com" }}]
 
 [default_certificate_policy]
@@ -4493,12 +5437,15 @@ kind = "reject"
         let listeners = vec![BootstrapListenerConfig {
             bind: "127.0.0.1:0".parse().expect("bind"),
         }];
-        let runtime_listeners =
-            acquire_runtime_listeners_with(ListenerAcquisitionMode::DirectBind, &listeners, || {
-                panic!("inherited listener acquirer must not be called in direct_bind mode")
-            })
-            .await
-            .expect("direct-bind listener selection");
+        let runtime_listeners = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::DirectBind,
+            &listeners,
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            || panic!("inherited listener acquirer must not be called in direct_bind mode"),
+            |_| Ok(()),
+        )
+        .await
+        .expect("direct-bind listener selection");
 
         assert_eq!(runtime_listeners.len(), 1);
         let bound_addr = runtime_listeners[0].local_addr().expect("bound addr");
@@ -4513,8 +5460,11 @@ kind = "reject"
         }];
         let runtime_listener_set = acquire_runtime_listener_set_with(
             ListenerAcquisitionMode::DirectBind,
+            true,
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
             &listeners,
             || panic!("inherited listener acquirer must not be called in direct_bind mode"),
+            |_| Ok(()),
         )
         .await
         .expect("direct-bind runtime listener set");
@@ -4529,6 +5479,26 @@ kind = "reject"
     }
 
     #[tokio::test]
+    async fn runtime_listener_selection_direct_bind_skips_udp_when_http3_quic_disabled() {
+        let listeners = vec![BootstrapListenerConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+        }];
+        let runtime_listener_set = acquire_runtime_listener_set_with(
+            ListenerAcquisitionMode::DirectBind,
+            false,
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            &listeners,
+            || panic!("inherited listener acquirer must not be called in direct_bind mode"),
+            |_| Ok(()),
+        )
+        .await
+        .expect("direct-bind runtime listener set");
+
+        assert_eq!(runtime_listener_set.tcp.len(), 1);
+        assert!(runtime_listener_set.quic_udp.is_empty());
+    }
+
+    #[tokio::test]
     async fn runtime_listener_selection_inherited_systemd_uses_inherited_listeners() {
         let inherited_listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind inherited listener");
@@ -4539,12 +5509,15 @@ kind = "reject"
             .set_nonblocking(true)
             .expect("set nonblocking");
 
-        let runtime_listeners =
-            acquire_runtime_listeners_with(ListenerAcquisitionMode::InheritedSystemd, &[], || {
-                Ok(vec![inherited_listener])
-            })
-            .await
-            .expect("inherited listener selection");
+        let runtime_listeners = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::InheritedSystemd,
+            &[],
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            || Ok(vec![inherited_listener]),
+            |_| Ok(()),
+        )
+        .await
+        .expect("inherited listener selection");
 
         assert_eq!(runtime_listeners.len(), 1);
         assert_eq!(
@@ -4568,8 +5541,11 @@ kind = "reject"
 
         let runtime_listener_set = acquire_runtime_listener_set_with(
             ListenerAcquisitionMode::InheritedSystemd,
+            false,
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
             &listeners,
             || Ok(vec![inherited_listener]),
+            |_| Ok(()),
         )
         .await
         .expect("inherited runtime listener set");
@@ -4580,14 +5556,19 @@ kind = "reject"
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_listener_selection_inherited_systemd_missing_env_is_deterministic() {
-        let err =
-            acquire_runtime_listeners_with(ListenerAcquisitionMode::InheritedSystemd, &[], || {
+        let err = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::InheritedSystemd,
+            &[],
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            || {
                 Err(FpError::invalid_configuration(
                     "missing required env var LISTEN_PID for systemd socket activation",
                 ))
-            })
-            .await
-            .expect_err("missing systemd env must fail deterministically");
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("missing systemd env must fail deterministically");
         assert_eq!(
             err.kind,
             fingerprint_proxy_core::error::ErrorKind::InvalidConfiguration
@@ -4601,11 +5582,17 @@ kind = "reject"
     #[tokio::test]
     async fn runtime_listener_selection_inherited_systemd_invalid_listener_state_is_deterministic()
     {
-        let err = acquire_runtime_listeners_with(ListenerAcquisitionMode::InheritedSystemd, &[], || {
-            Err(FpError::invalid_configuration(
-                "inherited fd 3 is not a valid TCP listener for systemd socket activation: invalid socket state",
-            ))
-        })
+        let err = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::InheritedSystemd,
+            &[],
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            || {
+                Err(FpError::invalid_configuration(
+                    "inherited fd 3 is not a valid TCP listener for systemd socket activation: invalid socket state",
+                ))
+            },
+            |_| Ok(()),
+        )
         .await
         .expect_err("invalid inherited listener state must fail deterministically");
 
@@ -4640,6 +5627,9 @@ kind = "reject"
                 .expect("server cfg");
         let deps = RuntimeDeps::new(Arc::new(runtime_builtin_pipeline()));
         let operational_state = deps.operational_state.clone();
+        deps.dynamic_config_state
+            .replace_active_domain_config_for_tests(make_minimal_runtime_domain_config())
+            .expect("seed test domain config");
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let err = tokio::time::timeout(
@@ -4739,6 +5729,7 @@ kind = "reject"
             Arc::clone(&runtime_stats),
             dynamic_config_state,
             Arc::clone(&upstream_tls_client_config),
+            RuntimeSettings::default(),
         );
         let req1 = HttpRequest::new("GET", "/", "HTTP/2");
         let pre1 = Http2RouterDeps::build_prepipeline_input(&deps, req1).expect("pre1");
@@ -4769,7 +5760,10 @@ kind = "reject"
             crate::health::SharedRuntimeOperationalState::new(),
             Arc::clone(&runtime_stats),
             dynamic_config_state,
-            Arc::clone(&upstream_tls_client_config),
+            RuntimeUpstreamSettings::new(
+                Arc::clone(&upstream_tls_client_config),
+                RuntimeSettings::default(),
+            ),
         );
 
         {
@@ -4811,7 +5805,10 @@ kind = "reject"
             crate::health::SharedRuntimeOperationalState::new(),
             Arc::clone(&runtime_stats),
             dynamic_config_state,
-            Arc::clone(&upstream_tls_client_config),
+            RuntimeUpstreamSettings::new(
+                Arc::clone(&upstream_tls_client_config),
+                RuntimeSettings::default(),
+            ),
         );
 
         let peer = Some(SocketAddr::from(([192, 0, 2, 10], 41234)));
@@ -4889,7 +5886,10 @@ kind = "reject"
             crate::health::SharedRuntimeOperationalState::new(),
             Arc::clone(&runtime_stats),
             dynamic_config_state,
-            Arc::clone(&upstream_tls_client_config),
+            RuntimeUpstreamSettings::new(
+                Arc::clone(&upstream_tls_client_config),
+                RuntimeSettings::default(),
+            ),
         );
         deps.set_runtime_fingerprinting_result(make_complete_fingerprinting_result(
             SystemTime::UNIX_EPOCH,
@@ -4927,6 +5927,7 @@ kind = "reject"
             Arc::clone(&runtime_stats),
             dynamic_config_state,
             Arc::clone(&upstream_tls_client_config),
+            RuntimeSettings::default(),
         );
 
         let peer = Some(SocketAddr::from(([192, 0, 2, 11], 42345)));
@@ -5004,6 +6005,7 @@ kind = "reject"
             Arc::clone(&runtime_stats),
             dynamic_config_state,
             Arc::clone(&upstream_tls_client_config),
+            RuntimeSettings::default(),
         );
         deps.set_runtime_fingerprinting_result(make_complete_fingerprinting_result(
             SystemTime::UNIX_EPOCH,
@@ -5042,7 +6044,10 @@ kind = "reject"
             crate::health::SharedRuntimeOperationalState::new(),
             Arc::clone(&runtime_stats),
             dynamic_config_state,
-            Arc::clone(&upstream_tls_client_config),
+            RuntimeUpstreamSettings::new(
+                Arc::clone(&upstream_tls_client_config),
+                RuntimeSettings::default(),
+            ),
         );
         let req = HttpRequest::new("GET", "/", "HTTP/1.1");
         let pre = Http1RouterDeps::build_prepipeline_input(&deps, req).expect("pre");
@@ -5190,6 +6195,63 @@ kind = "reject"
 
     #[test]
     fn runtime_connection_fingerprinting_maps_capture_failure_to_missing_required_data() {
+        let result = compute_runtime_fingerprinting_result_for_connection(
+            Some(SocketAddr::from(([192, 0, 2, 12], 43456))),
+            Some(SocketAddr::from(([198, 51, 100, 22], 443))),
+            None,
+            RuntimeTcpMetadataCaptureResult::failed(FingerprintFailureReason::MissingRequiredData),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(
+            result.fingerprints.ja4t.availability,
+            FingerprintAvailability::Unavailable
+        );
+        assert_eq!(result.fingerprints.ja4t.value, None);
+        assert_eq!(
+            result.fingerprints.ja4t.failure_reason,
+            Some(FingerprintFailureReason::MissingRequiredData)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_listener_acquisition_fails_when_saved_syn_enable_fails_by_default() {
+        let listeners = vec![BootstrapListenerConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+        }];
+
+        let err = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::DirectBind,
+            &listeners,
+            Ja4TMissingTcpMetadataPolicy::FailStartup,
+            || Ok(Vec::new()),
+            |_| Err(FpError::internal("injected TCP_SAVE_SYN enable failure")),
+        )
+        .await
+        .expect_err("fail-startup policy must reject saved-SYN enable failure");
+
+        assert_eq!(err.kind, ErrorKind::Internal);
+        assert!(err.message.contains("injected TCP_SAVE_SYN enable failure"));
+    }
+
+    #[tokio::test]
+    async fn runtime_listener_acquisition_allows_saved_syn_enable_failure_when_configured() {
+        let listeners = vec![BootstrapListenerConfig {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+        }];
+
+        let acquired = acquire_runtime_listeners_with(
+            ListenerAcquisitionMode::DirectBind,
+            &listeners,
+            Ja4TMissingTcpMetadataPolicy::AllowUnavailable,
+            || Ok(Vec::new()),
+            |_| Err(FpError::internal("injected TCP_SAVE_SYN enable failure")),
+        )
+        .await
+        .expect("allow_unavailable policy continues listener startup");
+
+        assert_eq!(acquired.len(), 1);
+
         let result = compute_runtime_fingerprinting_result_for_connection(
             Some(SocketAddr::from(([192, 0, 2, 12], 43456))),
             Some(SocketAddr::from(([198, 51, 100, 22], 443))),
@@ -5620,6 +6682,103 @@ kind = "reject"
             !request_headers.iter().any(|f| f.name == "x-ja4one"),
             "h2c must not emit JA4One without TLS ClientHello data"
         );
+
+        let _ = tcp.shutdown().await;
+        let res = server_rx.await.expect("server result");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn h2c_later_completed_stream_responds_while_first_continued_stream_is_slow() {
+        let (h2_port, seen_req) = start_upstream_h2c_slow_first_stream_stub();
+        let (port_exact, _seen_exact) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nexact".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pki = TestPki::generate();
+        let mut domain_config = make_domain_config_for_ports(port_exact, h2_port, https_port);
+        domain_config.virtual_hosts[1].protocol.allow_http2 = true;
+        domain_config.virtual_hosts[1]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+
+        let (addr, server_rx) = run_server_once_with_pipeline_and_read_buf_and_domain_config(
+            runtime_builtin_pipeline(),
+            4096,
+            pki.bootstrap_config(),
+            domain_config,
+        )
+        .await;
+
+        let mut tcp = TcpStream::connect(addr).await.expect("connect proxy");
+        let first_stream = StreamId::new(1).expect("first stream id");
+        let second_stream = StreamId::new(3).expect("second stream id");
+        let mut request = Vec::new();
+        request.extend_from_slice(ConnectionPreface::CLIENT_BYTES.as_slice());
+        request.extend_from_slice(&h2_settings_frame_bytes());
+        request.extend_from_slice(&h2_headers_only_request_frame_bytes(first_stream));
+        request.extend_from_slice(&h2_headers_only_request_frame_bytes(second_stream));
+        tcp.write_all(&request).await.expect("write h2c requests");
+
+        let frames = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_http2_frames_until_both_streams_complete(&mut tcp, first_stream, second_stream),
+        )
+        .await
+        .expect("both stream responses should complete");
+        let second_end_stream_index = frames
+            .iter()
+            .position(|frame| {
+                frame.header.stream_id == second_stream && frame.header.flags & 0x1 != 0
+            })
+            .expect("second stream END_STREAM");
+        let first_end_stream_index = frames
+            .iter()
+            .position(|frame| {
+                frame.header.stream_id == first_stream && frame.header.flags & 0x1 != 0
+            })
+            .expect("first stream END_STREAM");
+        assert!(
+            second_end_stream_index < first_end_stream_index,
+            "later stream response must be written before slow first stream completes"
+        );
+
+        let second_body: Vec<u8> = frames
+            .iter()
+            .filter(|frame| frame.header.stream_id == second_stream)
+            .filter_map(|frame| match &frame.payload {
+                Http2FramePayload::Data(data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(second_body, b"two");
+
+        let first_body: Vec<u8> = frames
+            .iter()
+            .filter(|frame| frame.header.stream_id == first_stream)
+            .filter_map(|frame| match &frame.payload {
+                Http2FramePayload::Data(data) => Some(data.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(first_body, b"one");
+
+        let raw = seen_req
+            .recv_timeout(Duration::from_secs(2))
+            .expect("seen upstream h2 requests");
+        assert!(h2_request_stream_completed(
+            &raw,
+            StreamId::new(1).expect("upstream first stream id")
+        ));
+        assert!(h2_request_stream_completed(
+            &raw,
+            StreamId::new(3).expect("upstream second stream id")
+        ));
 
         let _ = tcp.shutdown().await;
         let res = server_rx.await.expect("server result");
@@ -6140,6 +7299,63 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         (port, rx)
     }
 
+    fn start_upstream_h2c_slow_first_stream_stub() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut tmp).expect("read h2 requests");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if h2_request_stream_completed(&buf, StreamId::new(1).expect("stream id"))
+                    && h2_request_stream_completed(&buf, StreamId::new(3).expect("stream id"))
+                {
+                    break;
+                }
+                if buf.len() > 128 * 1024 {
+                    break;
+                }
+            }
+
+            let mut second_response = h2_settings_frame_bytes();
+            for frame in encode_h2_response_for_stream(3, b"two") {
+                second_response.extend_from_slice(
+                    &serialize_http2_frame(&frame).expect("serialize second response frame"),
+                );
+            }
+            stream
+                .write_all(&second_response)
+                .expect("write second response");
+
+            std::thread::sleep(Duration::from_millis(250));
+            let mut first_response = Vec::new();
+            for frame in encode_h2_response_for_stream(1, b"one") {
+                first_response.extend_from_slice(
+                    &serialize_http2_frame(&frame).expect("serialize first response frame"),
+                );
+            }
+            stream
+                .write_all(&first_response)
+                .expect("write first response");
+            drain_h2_window_updates!(stream);
+            let _ = tx.send(buf);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        (port, rx)
+    }
+
     fn start_upstream_h2c_dynamic_hpack_response_stub() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>)
     {
         use std::io::{Read, Write};
@@ -6537,6 +7753,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -6563,6 +7780,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -6605,6 +7823,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -6631,6 +7850,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -6657,6 +7877,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -6708,6 +7929,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     allow_http1: true,
                     allow_http2: false,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             }],
@@ -6782,6 +8004,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             allow_http1: true,
             allow_http2: false,
             allow_http3: true,
+            http2_server_push_policy: Http2ServerPushPolicy::Suppress,
         };
         let config = tls_configs
             .build_vhost_server_config(vhost)
@@ -6795,6 +8018,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             allow_http1: false,
             allow_http2: true,
             allow_http3: false,
+            http2_server_push_policy: Http2ServerPushPolicy::Suppress,
         };
         let config = tls_configs
             .build_vhost_server_config(vhost)
@@ -6805,6 +8029,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             allow_http1: true,
             allow_http2: true,
             allow_http3: true,
+            http2_server_push_policy: Http2ServerPushPolicy::Suppress,
         };
         let config = tls_configs
             .build_vhost_server_config(vhost)
@@ -6829,50 +8054,75 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
     }
 
     #[test]
-    fn new_connections_bind_latest_snapshot_while_existing_connections_keep_bound_snapshot() {
+    fn new_connections_bind_latest_combined_snapshot_while_existing_connections_keep_bound_snapshot(
+    ) {
         let pipeline = Arc::new(runtime_builtin_pipeline());
-        let mut deps = RuntimeDeps::new(pipeline);
+        let deps = RuntimeDeps::new(pipeline);
+        let old_tls_material = RuntimeTlsServerConfigs::test_material();
+        let new_tls_material = RuntimeTlsServerConfigs::test_material();
+        let old_cert = RuntimeTlsServerConfigs::certificate_der_from_material_for_test(
+            Arc::clone(&old_tls_material),
+            "test-cert",
+        )
+        .expect("old cert");
+        let new_cert = RuntimeTlsServerConfigs::certificate_der_from_material_for_test(
+            Arc::clone(&new_tls_material),
+            "test-cert",
+        )
+        .expect("new cert");
+        assert_ne!(old_cert.as_ref(), new_cert.as_ref());
 
         let mut revision_one = make_minimal_runtime_domain_config();
         revision_one.version = ConfigVersion::new("runtime-tests-rev1").expect("revision one");
-        deps.http1.set_domain_config(revision_one.clone());
-        deps.http2.set_domain_config(revision_one.clone());
+        deps.dynamic_config_state
+            .replace_active_runtime_snapshot_for_tests(revision_one.clone(), old_tls_material)
+            .expect("seed active revision");
 
         let first_connection = deps.clone_for_connection();
         first_connection
             .http1
-            .ensure_domain_config_loaded()
+            .ensure_runtime_config_loaded()
             .expect("bind first connection");
 
         let mut revision_two = revision_one;
         revision_two.version = ConfigVersion::new("runtime-tests-rev2").expect("revision two");
         deps.dynamic_config_state
-            .replace_active_domain_config_for_tests(revision_two)
+            .replace_active_runtime_snapshot_for_tests(revision_two, new_tls_material)
             .expect("replace active revision");
 
         let second_connection = deps.clone_for_connection();
         second_connection
             .http1
-            .ensure_domain_config_loaded()
+            .ensure_runtime_config_loaded()
             .expect("bind second connection");
 
-        let first_revision = first_connection
+        let first_snapshot = first_connection
             .http1
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
-            .expect("first snapshot")
-            .revision_id()
-            .as_str();
-        let second_revision = second_connection
+            .expect("first snapshot");
+        let second_snapshot = second_connection
             .http1
-            .bound_domain_snapshot
+            .bound_runtime_snapshot
             .get()
-            .expect("second snapshot")
-            .revision_id()
-            .as_str();
+            .expect("second snapshot");
+        let first_revision = first_snapshot.revision_id().as_str();
+        let second_revision = second_snapshot.revision_id().as_str();
+        let first_cert = RuntimeTlsServerConfigs::certificate_der_from_material_for_test(
+            first_snapshot.tls_material(),
+            "test-cert",
+        )
+        .expect("first cert");
+        let second_cert = RuntimeTlsServerConfigs::certificate_der_from_material_for_test(
+            second_snapshot.tls_material(),
+            "test-cert",
+        )
+        .expect("second cert");
 
         assert_eq!(first_revision, "runtime-tests-rev1");
         assert_eq!(second_revision, "runtime-tests-rev2");
+        assert_eq!(first_cert.as_ref(), old_cert.as_ref());
+        assert_eq!(second_cert.as_ref(), new_cert.as_ref());
     }
 
     #[test]
@@ -6947,8 +8197,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/health/ready", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -6972,8 +8223,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/health/ready", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -7024,8 +8276,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", path, "HTTP/1.1");
         let conn = deps.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
         forward_http1_continued_via_pipeline(deps, ctx).await
     }
 
@@ -7054,8 +8307,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
 
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -7091,8 +8345,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/blocked", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let err = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -7124,8 +8379,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/allowed", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -7159,8 +8415,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/default-selection", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -7311,8 +8568,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             .insert("x-client-header".to_string(), "abc".to_string());
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
@@ -7524,6 +8782,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                 fingerprint_proxy_upstream::pool::config::PoolSizeConfig::new(8, 2, 1)
                     .expect("pool size"),
                 fingerprint_proxy_upstream::pool::timeouts::PoolTimeoutConfig::default(),
+                None,
             )
             .expect("manager"),
         );
@@ -7622,6 +8881,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                 fingerprint_proxy_upstream::pool::config::PoolSizeConfig::new(8, 1, 1)
                     .expect("pool size"),
                 fingerprint_proxy_upstream::pool::timeouts::PoolTimeoutConfig::default(),
+                None,
             )
             .expect("manager"),
         );
@@ -7796,6 +9056,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("content-length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("date"));
         assert_eq!(
             deps.http2
                 .upstream_connection_manager
@@ -7825,8 +9086,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/h2-connect-fail", "HTTP/2");
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
@@ -7837,6 +9099,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("content-length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("date"));
     }
 
     #[tokio::test]
@@ -7860,14 +9123,57 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/h2-timeout", "HTTP/2");
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
             .expect("mapped response");
         assert_eq!(resp.version, "HTTP/2");
         assert_eq!(resp.status, Some(504));
+        assert_eq!(
+            resp.headers.get("content-length").map(String::as_str),
+            Some("0")
+        );
+        assert!(resp.headers.contains_key("date"));
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_body_limit_drives_http2_upstream_response_path() {
+        let (h2_port, _seen_req) =
+            start_upstream_h2c_stub(200, BTreeMap::new(), b"too-large".to_vec());
+        let (port_default, _seen_default) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ndefault".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pipeline = Arc::new(runtime_builtin_pipeline());
+        let settings = RuntimeSettings {
+            http2_upstream_limits: Http2UpstreamLimits { max_body_bytes: 3 },
+            ..RuntimeSettings::default()
+        };
+        let mut deps = RuntimeDeps::new_with_settings(pipeline, settings);
+        let mut domain = make_domain_config_for_ports(h2_port, port_default, https_port);
+        domain.virtual_hosts[0].protocol.allow_http2 = true;
+        domain.virtual_hosts[0]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+        deps.http2.set_domain_config(domain);
+        deps.http2.set_tls_sni(Some("example.com".to_string()));
+
+        let req = HttpRequest::new("GET", "/h2-body-limit", "HTTP/2");
+        let conn = deps.http2.new_connection(None, None);
+        let mut ctx = RequestContext::new(RequestId(1), conn, req);
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
+
+        let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
+            .await
+            .expect("mapped response");
+        assert_eq!(resp.version, "HTTP/2");
+        assert_eq!(resp.status, Some(502));
         assert_eq!(
             resp.headers.get("content-length").map(String::as_str),
             Some("0")
@@ -7904,8 +9210,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/h2-split", "HTTP/2");
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
@@ -7979,8 +9286,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             .insert("grpc-status-details-bin".to_string(), "AA==".to_string());
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
@@ -8065,6 +9373,181 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         assert!(saw_headers, "missing grpc request headers");
         assert!(saw_data, "missing grpc request data");
         assert!(saw_trailers, "missing grpc request trailers");
+    }
+
+    #[tokio::test]
+    async fn h2c_grpc_client_streaming_reaches_upstream_incrementally() {
+        let (h2_port, observed_rx) = start_upstream_h2c_grpc_bidi_stub();
+        let (port_exact, _seen_exact) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nexact".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pki = TestPki::generate();
+        let mut domain_config = make_domain_config_for_ports(port_exact, h2_port, https_port);
+        domain_config.virtual_hosts[1].protocol.allow_http2 = true;
+        domain_config.virtual_hosts[1]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+
+        let (addr, server_rx) = run_server_once_with_pipeline_and_read_buf_and_domain_config(
+            runtime_builtin_pipeline(),
+            8,
+            pki.bootstrap_config(),
+            domain_config,
+        )
+        .await;
+
+        let mut tcp = TcpStream::connect(addr).await.expect("connect proxy");
+        let stream_id = StreamId::new(1).expect("stream id");
+        tcp.write_all(ConnectionPreface::CLIENT_BYTES.as_slice())
+            .await
+            .expect("write h2c preface");
+        tcp.write_all(&h2_settings_frame_bytes())
+            .await
+            .expect("write settings");
+        tcp.write_all(&h2_grpc_request_headers_frame_bytes(stream_id, false))
+            .await
+            .expect("write grpc headers");
+
+        match recv_upstream_grpc_observed(&observed_rx, "upstream headers").await {
+            UpstreamGrpcObserved::Headers(fields) => {
+                assert!(fields
+                    .iter()
+                    .any(|f| f.name == "content-type" && f.value == "application/grpc"));
+            }
+            other => panic!("expected upstream headers, got {other:?}"),
+        }
+
+        let first = grpc_message_frame(b"one");
+        tcp.write_all(&h2_data_frame_bytes(stream_id, &first, false))
+            .await
+            .expect("write first grpc data");
+        match recv_upstream_grpc_observed(&observed_rx, "upstream first data").await {
+            UpstreamGrpcObserved::Data { bytes, end_stream } => {
+                assert_eq!(bytes, first);
+                assert!(!end_stream);
+            }
+            other => panic!("expected first upstream data, got {other:?}"),
+        }
+
+        let second = grpc_message_frame(b"two");
+        tcp.write_all(&h2_data_frame_bytes(stream_id, &second, false))
+            .await
+            .expect("write second grpc data");
+        match recv_upstream_grpc_observed(&observed_rx, "upstream second data").await {
+            UpstreamGrpcObserved::Data { bytes, end_stream } => {
+                assert_eq!(bytes, second);
+                assert!(!end_stream);
+            }
+            other => panic!("expected second upstream data, got {other:?}"),
+        }
+
+        let trailers = BTreeMap::from([(
+            String::from("grpc-status-details-bin"),
+            String::from("AA=="),
+        )]);
+        let mut trailer_encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        tcp.write_all(&h2_trailers_frame_bytes(
+            &mut trailer_encoder,
+            stream_id,
+            &trailers,
+        ))
+        .await
+        .expect("write grpc trailers");
+        match recv_upstream_grpc_observed(&observed_rx, "upstream trailers").await {
+            UpstreamGrpcObserved::Trailers(fields) => {
+                assert!(fields
+                    .iter()
+                    .any(|f| { f.name == "grpc-status-details-bin" && f.value == "AA==" }));
+            }
+            other => panic!("expected upstream trailers, got {other:?}"),
+        }
+
+        let (frames, _) = read_http2_frames_until_end_stream(&mut tcp, stream_id).await;
+        assert!(frames
+            .iter()
+            .any(|frame| matches!(&frame.payload, Http2FramePayload::Data(bytes) if bytes == &grpc_message_frame(b"first"))));
+
+        let _ = tcp.shutdown().await;
+        let res = server_rx.await.expect("server result");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn h2c_grpc_server_streaming_data_is_emitted_before_upstream_closes() {
+        let (h2_port, observed_rx) = start_upstream_h2c_grpc_bidi_stub();
+        let (port_exact, _seen_exact) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nexact".to_vec());
+        let (https_port, _seen_https) =
+            start_upstream_stub(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhttps".to_vec());
+
+        let pki = TestPki::generate();
+        let mut domain_config = make_domain_config_for_ports(port_exact, h2_port, https_port);
+        domain_config.virtual_hosts[1].protocol.allow_http2 = true;
+        domain_config.virtual_hosts[1]
+            .upstream
+            .allowed_upstream_app_protocols = Some(vec![UpstreamAppProtocol::Http2]);
+
+        let (addr, server_rx) = run_server_once_with_pipeline_and_read_buf_and_domain_config(
+            runtime_builtin_pipeline(),
+            8,
+            pki.bootstrap_config(),
+            domain_config,
+        )
+        .await;
+
+        let mut tcp = TcpStream::connect(addr).await.expect("connect proxy");
+        let stream_id = StreamId::new(1).expect("stream id");
+        tcp.write_all(ConnectionPreface::CLIENT_BYTES.as_slice())
+            .await
+            .expect("write h2c preface");
+        tcp.write_all(&h2_settings_frame_bytes())
+            .await
+            .expect("write settings");
+        tcp.write_all(&h2_grpc_request_headers_frame_bytes(stream_id, false))
+            .await
+            .expect("write grpc headers");
+
+        match recv_upstream_grpc_observed(&observed_rx, "upstream headers").await {
+            UpstreamGrpcObserved::Headers(_) => {}
+            other => panic!("expected upstream headers, got {other:?}"),
+        }
+
+        let data_frame =
+            read_http2_frames_until_data(&mut tcp, stream_id, Duration::from_secs(2)).await;
+        let Http2FramePayload::Data(bytes) = &data_frame.payload else {
+            panic!("expected DATA payload");
+        };
+        assert_eq!(bytes, &grpc_message_frame(b"first"));
+        assert_eq!(
+            data_frame.header.flags & 0x1,
+            0,
+            "first server-streaming DATA must not close the stream"
+        );
+
+        let mut trailer_encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        tcp.write_all(&h2_trailers_frame_bytes(
+            &mut trailer_encoder,
+            stream_id,
+            &BTreeMap::new(),
+        ))
+        .await
+        .expect("close client stream with trailers");
+
+        let (_frames, _) = read_http2_frames_until_end_stream(&mut tcp, stream_id).await;
+
+        let _ = tcp.shutdown().await;
+        let res = server_rx.await.expect("server result");
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -8207,8 +9690,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/h2-invalid", "HTTP/2");
         let conn = deps.http2.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http2_continued_via_pipeline(&deps.http2, ctx)
             .await
@@ -8242,8 +9726,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/d", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8289,6 +9774,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     allow_http1: true,
                     allow_http2: false,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             }],
@@ -8300,8 +9786,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/nope", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8311,6 +9798,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("Content-Length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
     }
 
     #[tokio::test]
@@ -8349,6 +9837,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -8375,6 +9864,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -8391,8 +9881,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/dest", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, Some(dest_addr));
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8438,6 +9929,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -8464,6 +9956,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                         allow_http1: true,
                         allow_http2: false,
                         allow_http3: false,
+                        http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                     },
                     module_config: BTreeMap::new(),
                 },
@@ -8480,8 +9973,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/default", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, Some(actual_dest));
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8560,6 +10054,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     allow_http1: true,
                     allow_http2: false,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             }],
@@ -8577,8 +10072,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/x", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8612,8 +10108,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/chunked", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8647,8 +10144,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/close", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8671,8 +10169,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/connect-fail", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8683,6 +10182,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("Content-Length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
         assert_eq!(
             resp.headers.get("Connection").map(String::as_str),
             Some("close")
@@ -8709,8 +10209,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/bad", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8721,6 +10222,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("Content-Length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
     }
 
     #[tokio::test]
@@ -8736,8 +10238,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/timeout", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8748,6 +10251,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("Content-Length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
     }
 
     #[tokio::test]
@@ -8765,8 +10269,9 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
         let req = HttpRequest::new("GET", "/big", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8777,6 +10282,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
             resp.headers.get("Content-Length").map(String::as_str),
             Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
     }
 
     #[tokio::test]
@@ -8809,7 +10315,12 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
             std::env::set_var(FP_DOMAIN_CONFIG_PATH_ENV_VAR, &path);
 
             let deps = RuntimeDeps::new(pipeline);
-            deps.http1.ensure_domain_config_loaded().expect("load");
+            deps.dynamic_config_state
+                .replace_active_domain_config_for_tests(
+                    fingerprint_proxy_bootstrap_config::domain_provider::load_domain_config()
+                        .expect("load domain config"),
+                )
+                .expect("seed loaded domain config");
 
             std::fs::remove_file(&path).expect("delete domain config file after load");
             deps
@@ -8817,15 +10328,16 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         let mut deps = deps.clone_for_connection();
         deps.http1
-            .ensure_domain_config_loaded()
+            .ensure_runtime_config_loaded()
             .expect("bind cached domain snapshot for connection");
         deps.http1.set_tls_sni(Some("example.com".to_string()));
 
         let req = HttpRequest::new("GET", "/cached", "HTTP/1.1");
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
 
         let resp = forward_http1_continued_via_pipeline(&deps.http1, ctx)
             .await
@@ -8893,13 +10405,14 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         let prepared = tls_configs
             .prepare_update(tls_assets)
             .expect("prepare tls update");
-        tls_configs
-            .apply_prepared(prepared)
-            .expect("publish tls update");
 
-        let server_config = tls_configs
-            .server_config_for_connection(&domain, Some("example.com"), None)
-            .expect("server config");
+        let server_config = RuntimeTlsServerConfigs::server_config_for_connection_from_material(
+            prepared.into_material(),
+            &domain,
+            Some("example.com"),
+            None,
+        )
+        .expect("server config");
         let presented = presented_certificate_for_server_config(
             server_config,
             &rotated_ca_cert_pem,
@@ -9008,7 +10521,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         fn handle(
             &self,
-            ctx: &mut fingerprint_proxy_core::request::RequestContext,
+            ctx: &mut fingerprint_proxy_core::request::PipelineModuleContext<'_>,
         ) -> PipelineModuleResult {
             set_response_status(ctx, self.status);
             let body = (self.body_for_uri)(&ctx.request.uri);
@@ -9068,21 +10581,18 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
                 .expect("server cfg");
 
         let pipeline = Arc::new(pipeline);
-        let mut deps = RuntimeDeps::new(pipeline);
+        let deps = RuntimeDeps::new(pipeline);
         let domain = make_minimal_runtime_domain_config();
-        deps.http1.set_domain_config(domain.clone());
-        deps.http2.set_domain_config(domain);
+        deps.dynamic_config_state
+            .replace_active_runtime_snapshot_for_tests(
+                domain,
+                tls_server_configs.current_material(),
+            )
+            .expect("seed runtime snapshot");
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
-            serve_listener(
-                listener,
-                tls_server_configs,
-                deps,
-                shutdown_rx,
-                graceful_timeout,
-            )
-            .await
+            serve_listener(listener, deps, shutdown_rx, graceful_timeout).await
         });
 
         (addr, shutdown_tx, handle, pki)
@@ -9136,6 +10646,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
                     allow_http1: true,
                     allow_http2: false,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             }],
@@ -9471,8 +10982,9 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         let conn = deps.http1.new_connection(None, None);
         let mut ctx = RequestContext::new(RequestId(1), conn, req);
-        ctx.fingerprinting_result =
-            Some(make_complete_fingerprinting_result(SystemTime::UNIX_EPOCH));
+        ctx = ctx.with_fingerprinting_result(make_complete_fingerprinting_result(
+            SystemTime::UNIX_EPOCH,
+        ));
         let pipeline_result = deps
             .http1
             .pipeline
@@ -9822,6 +11334,53 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         serialize_http2_frame(&frame).expect("serialize HEADERS")
     }
 
+    fn grpc_message_frame(message: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + message.len());
+        out.push(0);
+        out.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        out.extend_from_slice(message);
+        out
+    }
+
+    fn h2_grpc_request_headers_frame_bytes(stream_id: StreamId, end_stream: bool) -> Vec<u8> {
+        let mut encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        let mut block = Vec::new();
+        for (name, value) in [
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":authority", "example.com"),
+            (":path", "/grpc.Service/Method"),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ] {
+            block.extend_from_slice(&encoder.encode_literal_without_indexing(
+                &fingerprint_proxy_hpack::HeaderField {
+                    name: name.as_bytes().to_vec(),
+                    value: value.as_bytes().to_vec(),
+                },
+            ));
+        }
+
+        let mut flags = 0x4;
+        if end_stream {
+            flags |= 0x1;
+        }
+        let frame = Http2Frame {
+            header: Http2FrameHeader {
+                length: block.len() as u32,
+                frame_type: Http2FrameType::Headers,
+                flags,
+                stream_id,
+            },
+            payload: Http2FramePayload::Headers(block),
+        };
+        serialize_http2_frame(&frame).expect("serialize gRPC HEADERS")
+    }
+
     fn h2_data_frame_bytes(stream_id: StreamId, data: &[u8], end_stream: bool) -> Vec<u8> {
         let mut flags = 0u8;
         if end_stream {
@@ -9927,6 +11486,190 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         serialize_http2_frame(&frame).expect("serialize trailers HEADERS")
     }
 
+    #[derive(Debug)]
+    enum UpstreamGrpcObserved {
+        Headers(Vec<fingerprint_proxy_http2::HeaderField>),
+        Data { bytes: Vec<u8>, end_stream: bool },
+        Trailers(Vec<fingerprint_proxy_http2::HeaderField>),
+    }
+
+    async fn recv_upstream_grpc_observed(
+        rx: &std::sync::mpsc::Receiver<UpstreamGrpcObserved>,
+        label: &'static str,
+    ) -> UpstreamGrpcObserved {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match rx.try_recv() {
+                Ok(event) => return event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(tokio::time::Instant::now() < deadline, "{label}: timed out");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("{label}: disconnected");
+                }
+            }
+        }
+    }
+
+    fn start_upstream_h2c_grpc_bidi_stub() -> (u16, std::sync::mpsc::Receiver<UpstreamGrpcObserved>)
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            let mut buf = Vec::new();
+            let mut parsed_offset = 0usize;
+            let mut request_decoder =
+                fingerprint_proxy_hpack::Decoder::new(fingerprint_proxy_hpack::DecoderConfig {
+                    max_dynamic_table_size: 4096,
+                });
+            let mut response_started = false;
+            let mut tmp = [0u8; 1024];
+
+            loop {
+                let n = stream.read(&mut tmp).expect("read upstream h2c");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+
+                if parsed_offset == 0
+                    && buf.len() >= ConnectionPreface::CLIENT_BYTES.len()
+                    && buf.starts_with(ConnectionPreface::CLIENT_BYTES.as_slice())
+                {
+                    parsed_offset = ConnectionPreface::CLIENT_BYTES.len();
+                }
+
+                while parsed_offset < buf.len() {
+                    let (frame, consumed) = match parse_http2_frame(&buf[parsed_offset..]) {
+                        Ok(v) => v,
+                        Err(Http2ParseError::UnexpectedEof) => break,
+                        Err(err) => panic!("upstream parse error: {err:?}"),
+                    };
+                    parsed_offset += consumed;
+                    if frame.header.stream_id != StreamId::new(1).expect("stream id") {
+                        continue;
+                    }
+
+                    match frame.payload {
+                        Http2FramePayload::Headers(block) if !response_started => {
+                            let fields = decode_http2_header_block(
+                                &mut request_decoder,
+                                Http2HeaderBlockInput {
+                                    first_fragment: &block,
+                                    continuation_fragments: &[],
+                                },
+                            )
+                            .expect("decode grpc request headers");
+                            let _ = tx.send(UpstreamGrpcObserved::Headers(fields));
+                            response_started = true;
+                            let response = h2_grpc_initial_response_bytes(
+                                StreamId::new(1).expect("stream id"),
+                                b"first",
+                            );
+                            stream.write_all(&response).expect("write grpc response");
+                        }
+                        Http2FramePayload::Headers(block) => {
+                            let fields = decode_http2_header_block(
+                                &mut request_decoder,
+                                Http2HeaderBlockInput {
+                                    first_fragment: &block,
+                                    continuation_fragments: &[],
+                                },
+                            )
+                            .expect("decode grpc request trailers");
+                            let _ = tx.send(UpstreamGrpcObserved::Trailers(fields));
+                            let trailers = h2_grpc_response_trailers_bytes(
+                                StreamId::new(1).expect("stream id"),
+                            );
+                            stream.write_all(&trailers).expect("write grpc trailers");
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        Http2FramePayload::Data(bytes) => {
+                            let end_stream = frame.header.flags & 0x1 != 0;
+                            let _ = tx.send(UpstreamGrpcObserved::Data { bytes, end_stream });
+                            if end_stream {
+                                let trailers = h2_grpc_response_trailers_bytes(
+                                    StreamId::new(1).expect("stream id"),
+                                );
+                                stream.write_all(&trailers).expect("write grpc trailers");
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        (port, rx)
+    }
+
+    fn h2_grpc_initial_response_bytes(stream_id: StreamId, message: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        let mut block = Vec::new();
+        for (name, value) in [
+            (":status", "200"),
+            ("content-type", "application/grpc"),
+            ("grpc-encoding", "identity"),
+        ] {
+            block.extend_from_slice(&encoder.encode_literal_without_indexing(
+                &fingerprint_proxy_hpack::HeaderField {
+                    name: name.as_bytes().to_vec(),
+                    value: value.as_bytes().to_vec(),
+                },
+            ));
+        }
+        let headers = Http2Frame {
+            header: Http2FrameHeader {
+                length: block.len() as u32,
+                frame_type: Http2FrameType::Headers,
+                flags: 0x4,
+                stream_id,
+            },
+            payload: Http2FramePayload::Headers(block),
+        };
+        let data = Http2Frame {
+            header: Http2FrameHeader {
+                length: grpc_message_frame(message).len() as u32,
+                frame_type: Http2FrameType::Data,
+                flags: 0,
+                stream_id,
+            },
+            payload: Http2FramePayload::Data(grpc_message_frame(message)),
+        };
+        let mut out = h2_settings_frame_bytes();
+        out.extend_from_slice(&serialize_http2_frame(&headers).expect("serialize grpc headers"));
+        out.extend_from_slice(&serialize_http2_frame(&data).expect("serialize grpc data"));
+        out
+    }
+
+    fn h2_grpc_response_trailers_bytes(stream_id: StreamId) -> Vec<u8> {
+        let mut encoder =
+            fingerprint_proxy_hpack::Encoder::new(fingerprint_proxy_hpack::EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            });
+        let trailers = BTreeMap::from([(String::from("grpc-status"), String::from("0"))]);
+        h2_trailers_frame_bytes(&mut encoder, stream_id, &trailers)
+    }
+
     async fn read_http2_frames_until_end_stream<S>(
         stream: &mut S,
         stream_id: StreamId,
@@ -9971,6 +11714,59 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         }
     }
 
+    async fn read_http2_frames_until_both_streams_complete<S>(
+        stream: &mut S,
+        first_stream_id: StreamId,
+        second_stream_id: StreamId,
+    ) -> Vec<Http2Frame>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut frames = Vec::new();
+        let mut buf = Vec::new();
+        let mut reads = 0usize;
+        let mut first_complete = false;
+        let mut second_complete = false;
+        let mut tmp = [0u8; 11];
+
+        loop {
+            let mut offset = 0usize;
+            while offset < buf.len() {
+                match parse_http2_frame(&buf[offset..]) {
+                    Ok((frame, consumed)) => {
+                        offset += consumed;
+                        if frame.header.stream_id == first_stream_id
+                            && frame.header.flags & 0x1 != 0
+                        {
+                            first_complete = true;
+                        }
+                        if frame.header.stream_id == second_stream_id
+                            && frame.header.flags & 0x1 != 0
+                        {
+                            second_complete = true;
+                        }
+                        frames.push(frame);
+                        if first_complete && second_complete {
+                            return frames;
+                        }
+                    }
+                    Err(Http2ParseError::UnexpectedEof) => break,
+                    Err(err) => panic!("HTTP/2 parse error in response: {err:?}"),
+                }
+            }
+
+            if offset > 0 {
+                buf.drain(0..offset);
+            }
+
+            let n = stream.read(&mut tmp).await.expect("HTTP/2 read");
+            assert!(n > 0, "unexpected EOF while awaiting HTTP/2 responses");
+            reads += 1;
+            buf.extend_from_slice(&tmp[..n]);
+            assert!(reads <= 4096, "too many reads without completing responses");
+        }
+    }
+
     async fn read_http2_frames_until_count<S>(
         stream: &mut S,
         expected_count: usize,
@@ -10012,6 +11808,45 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         frames
     }
 
+    async fn read_http2_frames_until_data<S>(
+        stream: &mut S,
+        stream_id: StreamId,
+        timeout: Duration,
+    ) -> Http2Frame
+    where
+        S: AsyncRead + Unpin,
+    {
+        tokio::time::timeout(timeout, async {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 11];
+            loop {
+                let mut offset = 0usize;
+                while offset < buf.len() {
+                    match parse_http2_frame(&buf[offset..]) {
+                        Ok((frame, consumed)) => {
+                            offset += consumed;
+                            if frame.header.stream_id == stream_id
+                                && frame.header.frame_type == Http2FrameType::Data
+                            {
+                                return frame;
+                            }
+                        }
+                        Err(Http2ParseError::UnexpectedEof) => break,
+                        Err(err) => panic!("HTTP/2 parse error in response: {err:?}"),
+                    }
+                }
+                if offset > 0 {
+                    buf.drain(0..offset);
+                }
+                let n = stream.read(&mut tmp).await.expect("HTTP/2 read");
+                assert!(n > 0, "unexpected EOF while awaiting HTTP/2 DATA");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await
+        .expect("timed out awaiting HTTP/2 DATA")
+    }
+
     #[derive(Debug)]
     struct TerminateWithChunkedTrailersModule {
         status: u16,
@@ -10027,7 +11862,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         fn handle(
             &self,
-            ctx: &mut fingerprint_proxy_core::request::RequestContext,
+            ctx: &mut fingerprint_proxy_core::request::PipelineModuleContext<'_>,
         ) -> PipelineModuleResult {
             set_response_status(ctx, self.status);
             ctx.response.headers = self.headers.clone();
@@ -10050,7 +11885,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         fn handle(
             &self,
-            ctx: &mut fingerprint_proxy_core::request::RequestContext,
+            ctx: &mut fingerprint_proxy_core::request::PipelineModuleContext<'_>,
         ) -> PipelineModuleResult {
             for (k, v) in &self.expected_trailers {
                 if ctx.request.headers.contains_key(k) {
@@ -10098,7 +11933,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         fn handle(
             &self,
-            ctx: &mut fingerprint_proxy_core::request::RequestContext,
+            ctx: &mut fingerprint_proxy_core::request::PipelineModuleContext<'_>,
         ) -> PipelineModuleResult {
             for (k, v) in &self.expected_trailers {
                 if ctx.request.headers.contains_key(k) {
@@ -10341,7 +12176,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
     }
 
     #[tokio::test]
-    async fn http1_over_tls_rejects_lf_only_framing() {
+    async fn http1_over_tls_malformed_request_returns_400() {
         let pki = TestPki::generate();
         let pipeline = Pipeline::new(vec![Box::new(TerminateWithBodyModule {
             status: 200,
@@ -10365,16 +12200,23 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
 
         let invalid = b"GET / HTTP/1.1\nHost: example.com\n\n";
         tls.write_all(invalid).await.expect("write invalid");
-        let _ = tls.shutdown().await;
 
-        let err = server_rx
-            .await
-            .expect("server result")
-            .expect_err("must error");
+        let mut responses = read_n_http1_responses(&mut tls, 1).await;
+        let (resp, body) = responses.pop().expect("one response");
+        assert_eq!(resp.status, Some(400));
         assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
+            resp.headers.get("Content-Length").map(String::as_str),
+            Some("0")
         );
+        assert!(resp.headers.contains_key("Date"));
+        assert_eq!(
+            resp.headers.get("Connection").map(String::as_str),
+            Some("close")
+        );
+        assert!(body.is_empty());
+
+        let res = server_rx.await.expect("server result");
+        assert!(res.is_ok());
     }
 
     #[tokio::test]

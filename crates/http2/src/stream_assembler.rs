@@ -11,6 +11,15 @@ type StepResult = Result<(AssemblerState, Option<StreamEvent>), Box<(FpError, As
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     RequestHeadersReady(HttpRequest),
+    RequestBodyData {
+        bytes: Vec<u8>,
+        end_stream: bool,
+        request_complete: Option<HttpRequest>,
+    },
+    RequestTrailersReady {
+        trailers: std::collections::BTreeMap<String, String>,
+        request_complete: HttpRequest,
+    },
     RequestComplete(HttpRequest),
 }
 
@@ -315,10 +324,13 @@ fn step_headers_complete(
                 };
                 trailers.extend(parsed);
                 request.body = body;
-                request.trailers = trailers;
+                request.trailers = trailers.clone();
                 return Ok((
                     AssemblerState::Complete,
-                    Some(StreamEvent::RequestComplete(request)),
+                    Some(StreamEvent::RequestTrailersReady {
+                        trailers,
+                        request_complete: request,
+                    }),
                 ));
             }
 
@@ -359,11 +371,16 @@ fn step_headers_complete(
 
     let frame_end_stream = (frame.header.flags & FLAG_END_STREAM) != 0;
     if frame_end_stream {
-        request.body = body;
+        request.body = body.clone();
         request.trailers = trailers;
+        let bytes = bytes.clone();
         return Ok((
             AssemblerState::Complete,
-            Some(StreamEvent::RequestComplete(request)),
+            Some(StreamEvent::RequestBodyData {
+                bytes,
+                end_stream: true,
+                request_complete: Some(request),
+            }),
         ));
     }
 
@@ -373,7 +390,11 @@ fn step_headers_complete(
             body,
             trailers,
         },
-        None,
+        Some(StreamEvent::RequestBodyData {
+            bytes,
+            end_stream: false,
+            request_complete: None,
+        }),
     ))
 }
 
@@ -475,10 +496,13 @@ fn step_collecting_trailer_block(
     };
 
     request.body = body;
-    request.trailers = parsed;
+    request.trailers = parsed.clone();
     Ok((
         AssemblerState::Complete,
-        Some(StreamEvent::RequestComplete(request)),
+        Some(StreamEvent::RequestTrailersReady {
+            trailers: parsed,
+            request_complete: request,
+        }),
     ))
 }
 

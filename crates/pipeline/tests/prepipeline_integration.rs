@@ -3,7 +3,7 @@ use fingerprint_proxy_core::enrichment::ModuleDecision;
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse};
+use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, PipelineModuleContext};
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::Pipeline;
 use fingerprint_proxy_prepipeline::{build_request_context, PrePipelineInput};
@@ -58,13 +58,9 @@ impl PipelineModule for AssertFingerprintsPresentAtStart {
         "assert_fingerprints_present"
     }
 
-    fn handle(
-        &self,
-        ctx: &mut fingerprint_proxy_core::request::RequestContext,
-    ) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         let got = ctx
-            .fingerprinting_result
-            .as_ref()
+            .fingerprinting_result()
             .expect("fingerprinting_result must be set before pipeline execution");
         assert_eq!(got, &self.expected);
         Ok(ModuleDecision::Continue)

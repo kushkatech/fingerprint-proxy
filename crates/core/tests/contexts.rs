@@ -31,5 +31,5 @@ fn request_context_starts_without_fingerprinting_result() {
         ctx.stage,
         fingerprint_proxy_core::enrichment::ProcessingStage::Request
     );
-    assert!(ctx.fingerprinting_result.is_none());
+    assert!(ctx.fingerprinting_result().is_none());
 }

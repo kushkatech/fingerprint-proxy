@@ -2,6 +2,8 @@ use fingerprint_proxy_bootstrap_config::certificates::load_tls_certificates;
 use fingerprint_proxy_bootstrap_config::config::{
     BootstrapConfig, CertificateRef, DefaultCertificatePolicy, ListenerAcquisitionMode,
     ListenerConfig, ServerNamePattern, SystemLimits, SystemTimeouts, TlsCertificateConfig,
+    TlsPrivateKeyFileProviderConfig, TlsPrivateKeyKnownUnsupportedProviderKind,
+    TlsPrivateKeyProviderConfig, TlsPrivateKeyUnknownProviderConfig,
 };
 use fingerprint_proxy_core::error::ErrorKind;
 use std::collections::BTreeMap;
@@ -9,6 +11,8 @@ use std::collections::BTreeMap;
 fn base_bootstrap_config() -> BootstrapConfig {
     BootstrapConfig {
         listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+        enable_http3_quic_listeners: false,
+        fingerprinting: fingerprint_proxy_bootstrap_config::config::FingerprintingConfig::default(),
         listeners: vec![ListenerConfig {
             bind: "127.0.0.1:0".parse().expect("bind"),
         }],
@@ -66,6 +70,12 @@ fn generate_leaf(ca: &rcgen::Certificate, names: Vec<&str>) -> (String, String) 
     (cert_pem, key_pem)
 }
 
+fn file_private_key_provider(path: impl Into<String>) -> TlsPrivateKeyProviderConfig {
+    TlsPrivateKeyProviderConfig::File(TlsPrivateKeyFileProviderConfig {
+        pem_path: path.into(),
+    })
+}
+
 #[test]
 fn loads_valid_chain_and_key_into_selection_config() {
     let ca = generate_ca();
@@ -85,13 +95,17 @@ fn loads_valid_chain_and_key_into_selection_config() {
         TlsCertificateConfig {
             id: "default".to_string(),
             certificate_pem_path: default_cert_path.to_string_lossy().to_string(),
-            private_key_pem_path: default_key_path.to_string_lossy().to_string(),
+            private_key_provider: file_private_key_provider(
+                default_key_path.to_string_lossy().to_string(),
+            ),
             server_names: Vec::new(),
         },
         TlsCertificateConfig {
             id: "example".to_string(),
             certificate_pem_path: example_cert_path.to_string_lossy().to_string(),
-            private_key_pem_path: example_key_path.to_string_lossy().to_string(),
+            private_key_provider: file_private_key_provider(
+                example_key_path.to_string_lossy().to_string(),
+            ),
             server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
         },
     ];
@@ -111,7 +125,7 @@ fn missing_certificate_file_is_deterministic_error() {
     cfg.tls_certificates = vec![TlsCertificateConfig {
         id: "example".to_string(),
         certificate_pem_path: "/no/such/cert.pem".to_string(),
-        private_key_pem_path: key_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider(key_path.to_string_lossy().to_string()),
         server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
     }];
 
@@ -133,7 +147,7 @@ fn invalid_certificate_pem_is_deterministic_error() {
     cfg.tls_certificates = vec![TlsCertificateConfig {
         id: "example".to_string(),
         certificate_pem_path: cert_path.to_string_lossy().to_string(),
-        private_key_pem_path: key_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider(key_path.to_string_lossy().to_string()),
         server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
     }];
 
@@ -153,13 +167,16 @@ fn missing_private_key_pem_is_deterministic_error() {
     cfg.tls_certificates = vec![TlsCertificateConfig {
         id: "example".to_string(),
         certificate_pem_path: cert_path.to_string_lossy().to_string(),
-        private_key_pem_path: key_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider(key_path.to_string_lossy().to_string()),
         server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
     }];
 
     let err = load_tls_certificates(&cfg).expect_err("missing key must error");
     assert_eq!(err.kind, ErrorKind::ValidationFailed);
-    assert!(err.message.contains("missing TLS private key PEM:"));
+    assert!(err.message.contains("missing TLS private key PEM"));
+    assert!(!err
+        .message
+        .contains(&key_path.to_string_lossy().to_string()));
 }
 
 #[test]
@@ -175,7 +192,7 @@ fn private_key_mismatch_is_deterministic_error() {
     cfg.tls_certificates = vec![TlsCertificateConfig {
         id: "mismatch".to_string(),
         certificate_pem_path: cert_path.to_string_lossy().to_string(),
-        private_key_pem_path: key_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider(key_path.to_string_lossy().to_string()),
         server_names: vec![ServerNamePattern::Exact("b.example".to_string())],
     }];
 
@@ -183,5 +200,98 @@ fn private_key_mismatch_is_deterministic_error() {
     assert_eq!(err.kind, ErrorKind::ValidationFailed);
     assert!(err
         .message
-        .contains("TLS private key does not match certificate:"));
+        .contains("TLS private key does not match certificate"));
+    assert!(!err
+        .message
+        .contains(&key_path.to_string_lossy().to_string()));
+}
+
+#[test]
+fn missing_file_provider_path_is_deterministic_loading_error_without_path_leakage() {
+    let ca = generate_ca();
+    let (cert_pem, _key_pem) = generate_leaf(&ca, vec!["example.com"]);
+    let cert_path = write_temp_file("cert.pem", &cert_pem);
+
+    let mut cfg = base_bootstrap_config();
+    cfg.tls_certificates = vec![TlsCertificateConfig {
+        id: "example".to_string(),
+        certificate_pem_path: cert_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider("   ".to_string()),
+        server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
+    }];
+
+    let err = load_tls_certificates(&cfg).expect_err("blank key path must error");
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("file private key provider pem_path must be non-empty"));
+    assert!(!err.message.contains("   "));
+}
+
+#[test]
+fn missing_private_key_file_does_not_echo_provider_path() {
+    let ca = generate_ca();
+    let (cert_pem, _key_pem) = generate_leaf(&ca, vec!["example.com"]);
+    let cert_path = write_temp_file("cert.pem", &cert_pem);
+    let secret_key_path = "/tmp/private/provider/path/that/must/not/leak.key";
+
+    let mut cfg = base_bootstrap_config();
+    cfg.tls_certificates = vec![TlsCertificateConfig {
+        id: "example".to_string(),
+        certificate_pem_path: cert_path.to_string_lossy().to_string(),
+        private_key_provider: file_private_key_provider(secret_key_path.to_string()),
+        server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
+    }];
+
+    let err = load_tls_certificates(&cfg).expect_err("missing key file must error");
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err.message.contains("missing TLS private key file"));
+    assert!(!err.message.contains(secret_key_path));
+}
+
+#[test]
+fn known_unsupported_private_key_provider_is_deterministic_loading_error() {
+    let ca = generate_ca();
+    let (cert_pem, _key_pem) = generate_leaf(&ca, vec!["example.com"]);
+    let cert_path = write_temp_file("cert.pem", &cert_pem);
+
+    let mut cfg = base_bootstrap_config();
+    cfg.tls_certificates = vec![TlsCertificateConfig {
+        id: "example".to_string(),
+        certificate_pem_path: cert_path.to_string_lossy().to_string(),
+        private_key_provider: TlsPrivateKeyProviderConfig::KnownUnsupported(
+            TlsPrivateKeyKnownUnsupportedProviderKind::Pkcs11,
+        ),
+        server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
+    }];
+
+    let err = load_tls_certificates(&cfg).expect_err("unsupported provider must error");
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err.message.contains("private key provider kind `pkcs11`"));
+    assert!(err.message.contains("recognized but not supported"));
+}
+
+#[test]
+fn unknown_private_key_provider_is_deterministic_loading_error() {
+    let ca = generate_ca();
+    let (cert_pem, _key_pem) = generate_leaf(&ca, vec!["example.com"]);
+    let cert_path = write_temp_file("cert.pem", &cert_pem);
+
+    let mut cfg = base_bootstrap_config();
+    cfg.tls_certificates = vec![TlsCertificateConfig {
+        id: "example".to_string(),
+        certificate_pem_path: cert_path.to_string_lossy().to_string(),
+        private_key_provider: TlsPrivateKeyProviderConfig::Unknown(
+            TlsPrivateKeyUnknownProviderConfig {
+                kind: "vault".to_string(),
+            },
+        ),
+        server_names: vec![ServerNamePattern::Exact("example.com".to_string())],
+    }];
+
+    let err = load_tls_certificates(&cfg).expect_err("unknown provider must error");
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("unknown private key provider kind `vault`"));
 }

@@ -4,11 +4,13 @@ use fingerprint_proxy_core::error::{ErrorKind, FpError, FpResult};
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{
+    HttpRequest, HttpResponse, PipelineModuleContext, RequestContext,
+};
 use fingerprint_proxy_http1::request::ParseOptions;
 use fingerprint_proxy_http1::response::parse_http1_response;
 use fingerprint_proxy_http1_orchestrator::{
-    AssemblerInput, Http1ConnectionRouter, Http1ProcessOutput, Http1RouterDeps,
+    AssemblerInput, Http1ConnectionRouter, Http1ProcessOutput, Http1RouterDeps, Limits,
 };
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::response::set_response_status;
@@ -67,8 +69,37 @@ fn split_http1_message(raw: &[u8]) -> (&[u8], &[u8]) {
 fn expect_responses(output: Http1ProcessOutput) -> Vec<Vec<u8>> {
     match output {
         Http1ProcessOutput::Responses(responses) => responses,
+        Http1ProcessOutput::CloseAfterResponses(_) => {
+            panic!("expected reusable HTTP/1 responses")
+        }
         Http1ProcessOutput::WebSocketUpgrade(_) => panic!("expected HTTP/1 responses"),
     }
+}
+
+fn expect_close_after_responses(output: Http1ProcessOutput) -> Vec<Vec<u8>> {
+    match output {
+        Http1ProcessOutput::CloseAfterResponses(responses) => responses,
+        Http1ProcessOutput::Responses(_) => panic!("expected close-after HTTP/1 responses"),
+        Http1ProcessOutput::WebSocketUpgrade(_) => panic!("expected HTTP/1 responses"),
+    }
+}
+
+fn assert_single_error_response(output: Http1ProcessOutput, expected_status: u16) {
+    let out = expect_close_after_responses(output);
+    assert_eq!(out.len(), 1);
+    let (head, body) = split_http1_message(&out[0]);
+    let resp = parse_http1_response(head, ParseOptions::default()).expect("parse");
+    assert_eq!(resp.status, Some(expected_status));
+    assert_eq!(
+        resp.headers.get("Content-Length").map(String::as_str),
+        Some("0")
+    );
+    assert!(resp.headers.contains_key("Date"));
+    assert_eq!(
+        resp.headers.get("Connection").map(String::as_str),
+        Some("close")
+    );
+    assert!(body.is_empty());
 }
 
 struct TerminateModule {
@@ -82,7 +113,7 @@ impl PipelineModule for TerminateModule {
         "terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, self.status);
         ctx.response.headers = self.headers.clone();
         ctx.response.body = self.body.clone();
@@ -100,7 +131,7 @@ impl PipelineModule for TerminateWithTrailers {
         "terminate-with-trailers"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 200);
         ctx.response.trailers = self.trailers.clone();
         ctx.response.body = self.body.clone();
@@ -115,7 +146,7 @@ impl PipelineModule for ContinueModule {
         "cont"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Ok(ModuleDecision::Continue)
     }
 }
@@ -127,7 +158,7 @@ impl PipelineModule for ErrorModule {
         "err"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Err(FpError::internal("boom"))
     }
 }
@@ -161,7 +192,7 @@ impl Http1RouterDeps for TestDeps<'_> {
     {
         Box::pin(async move {
             Err(FpError::invalid_protocol_data(
-                "STUB[T289]: HTTP/1 upstream is not implemented",
+                "test upstream handler rejected continued request",
             ))
         })
     }
@@ -271,6 +302,85 @@ async fn router_invalid_response_trailer_name_or_value_is_invalid_protocol_data(
 }
 
 #[tokio::test]
+async fn router_malformed_client_request_returns_400_and_closes() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 200,
+        headers: BTreeMap::new(),
+        body: b"ok".to_vec(),
+    })]);
+    let deps = TestDeps {
+        pipeline: &pipeline,
+    };
+    let mut router = Http1ConnectionRouter::new();
+
+    let out = router
+        .process(
+            AssemblerInput::Bytes(b"GET / HTTP/1.1\nHost: example.com\n\n"),
+            &deps,
+        )
+        .await
+        .expect("client errors are serialized");
+
+    assert_single_error_response(out, 400);
+}
+
+#[tokio::test]
+async fn router_oversized_client_headers_return_431_and_closes() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 200,
+        headers: BTreeMap::new(),
+        body: b"ok".to_vec(),
+    })]);
+    let deps = TestDeps {
+        pipeline: &pipeline,
+    };
+    let limits = Limits {
+        max_header_bytes: 16,
+        ..Limits::default()
+    };
+    let mut router = Http1ConnectionRouter::with_limits(limits);
+
+    let out = router
+        .process(
+            AssemblerInput::Bytes(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+            &deps,
+        )
+        .await
+        .expect("client errors are serialized");
+
+    assert_single_error_response(out, 431);
+}
+
+#[tokio::test]
+async fn router_oversized_client_body_returns_413_and_closes() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 200,
+        headers: BTreeMap::new(),
+        body: b"ok".to_vec(),
+    })]);
+    let deps = TestDeps {
+        pipeline: &pipeline,
+    };
+    let limits = Limits {
+        max_body_bytes: 4,
+        ..Limits::default()
+    };
+    let mut router = Http1ConnectionRouter::with_limits(limits);
+
+    let out = router
+        .process(
+            AssemblerInput::Bytes(
+                b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n",
+            ),
+            &deps,
+        )
+        .await
+        .expect("client errors are serialized");
+
+    assert_single_error_response(out, 413);
+}
+
+#[tokio::test]
 async fn router_continued_is_error() {
     let pipeline = Pipeline::new(vec![Box::new(ContinueModule)]);
     let deps = TestDeps {
@@ -286,7 +396,7 @@ async fn router_continued_is_error() {
     assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
     assert_eq!(
         err.message,
-        "STUB[T289]: HTTP/1 upstream is not implemented"
+        "test upstream handler rejected continued request"
     );
 }
 

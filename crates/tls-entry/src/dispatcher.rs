@@ -1,7 +1,7 @@
 use crate::handshake::{NegotiatedAlpn, ERROR_MISSING_ALPN, ERROR_UNSUPPORTED_ALPN};
 use fingerprint_proxy_core::error::{FpError, FpResult};
 use fingerprint_proxy_http1_orchestrator::{
-    AssemblerInput, Http1ConnectionRouter, Http1ProcessOutput, Http1RouterDeps,
+    AssemblerInput, Http1ConnectionRouter, Http1ProcessOutput, Http1RouterDeps, Limits,
     PendingWebSocketUpgrade,
 };
 use fingerprint_proxy_http2::{
@@ -28,6 +28,7 @@ pub enum DispatcherInput<'a> {
 #[derive(Debug)]
 pub enum DispatcherOutput {
     Http1Responses(Vec<Vec<u8>>),
+    Http1CloseAfterResponses(Vec<Vec<u8>>),
     Http1WebSocketUpgrade(Box<PendingWebSocketUpgrade>),
     Http2Frames(Vec<fingerprint_proxy_http2::frames::Frame>),
     Http3Frames(Vec<Http3Frame>),
@@ -52,6 +53,13 @@ pub struct TlsEntryDispatcher {
 impl TlsEntryDispatcher {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_http1_limits(limits: Limits) -> Self {
+        Self {
+            http1: Http1ConnectionRouter::with_limits(limits),
+            ..Self::default()
+        }
     }
 
     pub async fn dispatch(
@@ -81,6 +89,9 @@ impl TlsEntryDispatcher {
         };
         match self.http1.process(input, deps.http1()).await? {
             Http1ProcessOutput::Responses(out) => Ok(DispatcherOutput::Http1Responses(out)),
+            Http1ProcessOutput::CloseAfterResponses(out) => {
+                Ok(DispatcherOutput::Http1CloseAfterResponses(out))
+            }
             Http1ProcessOutput::WebSocketUpgrade(upgrade) => {
                 Ok(DispatcherOutput::Http1WebSocketUpgrade(upgrade))
             }
@@ -124,6 +135,12 @@ impl TlsEntryDispatcher {
                         ));
                     }
                 }
+            }
+
+            if matches!(frame.payload, Http2FramePayload::PushPromise(_)) {
+                return Err(FpError::invalid_protocol_data(
+                    "HTTP/2 client-originated PUSH_PROMISE is protocol invalid",
+                ));
             }
 
             let event = self

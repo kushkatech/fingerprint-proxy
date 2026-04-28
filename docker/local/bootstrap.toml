@@ -6,7 +6,7 @@ bind = "0.0.0.0:443"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "/app/certs/default.crt"
-private_key_pem_path = "/app/certs/default.key"
+private_key_provider = { kind = "file", pem_path = "/app/certs/default.key" }
 server_names = [
   { kind = "exact", value = "localhost" },
 ]

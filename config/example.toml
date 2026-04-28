@@ -17,7 +17,7 @@ bind = "[::]:443"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "/etc/fingerprint-proxy/certs/default.crt"
-private_key_pem_path = "/etc/fingerprint-proxy/certs/default.key"
+private_key_provider = { kind = "file", pem_path = "/etc/fingerprint-proxy/certs/default.key" }
 server_names = [
   { kind = "exact", value = "example.com" },
   { kind = "wildcard_suffix", value = ".example.com" },

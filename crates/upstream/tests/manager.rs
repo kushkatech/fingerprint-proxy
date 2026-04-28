@@ -427,6 +427,7 @@ async fn manager_http2_release_after_exclusive_checkout_reports_pool_full_withou
         fingerprint_proxy_upstream::http2::default_tls_client_config(),
         PoolSizeConfig::new(8, 1, 128).expect("pool size"),
         PoolTimeoutConfig::default(),
+        None,
     )
     .expect("manager");
     let make_io = || -> BoxedUpstreamIo {
@@ -538,6 +539,7 @@ async fn manager_http2_shared_session_registry_tracks_multiple_live_sessions_per
         fingerprint_proxy_upstream::http2::default_tls_client_config(),
         PoolSizeConfig::new(8, 2, 4).expect("pool size"),
         PoolTimeoutConfig::default(),
+        None,
     )
     .expect("manager");
     let (session_one, server_one, owner_one) = make_shared_session();
@@ -613,6 +615,7 @@ async fn manager_http2_shared_session_registry_exact_removal_preserves_other_ses
         fingerprint_proxy_upstream::http2::default_tls_client_config(),
         PoolSizeConfig::new(8, 3, 4).expect("pool size"),
         PoolTimeoutConfig::default(),
+        None,
     )
     .expect("manager");
     let (session_one, server_one, owner_one) = make_shared_session();
@@ -686,6 +689,7 @@ async fn manager_http2_shared_session_registry_does_not_return_closed_sessions()
         fingerprint_proxy_upstream::http2::default_tls_client_config(),
         PoolSizeConfig::new(8, 2, 4).expect("pool size"),
         PoolTimeoutConfig::default(),
+        None,
     )
     .expect("manager");
     let (closed_session, closed_server, closed_owner) = make_shared_session();

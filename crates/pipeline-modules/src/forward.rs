@@ -1,7 +1,7 @@
 use crate::fingerprint_header;
 use fingerprint_proxy_core::enrichment::ModuleDecision;
 use fingerprint_proxy_core::error::{FpError, FpResult};
-use fingerprint_proxy_core::request::RequestContext;
+use fingerprint_proxy_core::request::{PipelineModuleContext, RequestContext};
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 
 pub const MODULE_NAME: &str = "forward";
@@ -31,7 +31,7 @@ impl PipelineModule for ForwardModule {
         DEPENDS_ON
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         ctx.pipeline_state.request_stage_forwarding_ready = true;
         Ok(ModuleDecision::Continue)
     }
@@ -104,8 +104,9 @@ mod tests {
     #[test]
     fn ensure_pipeline_forwarding_ready_accepts_ready_state() {
         let mut ctx = make_ctx("HTTP/1.1");
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         ForwardModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("forward handle");
         assert!(!ctx.module_config.contains_key(MODULE_NAME));
         ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http1)
@@ -115,8 +116,9 @@ mod tests {
     #[test]
     fn ensure_pipeline_forwarding_ready_rejects_protocol_mismatch() {
         let mut ctx = make_ctx("HTTP/1.1");
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         ForwardModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("forward handle");
         let err = ensure_pipeline_forwarding_ready(&ctx, ContinuedForwardProtocol::Http2)
             .expect_err("mismatch");

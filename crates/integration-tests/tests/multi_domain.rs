@@ -262,13 +262,13 @@ bind = "127.0.0.1:{listener_port}"
 [[tls_certificates]]
 id = "alpha"
 certificate_pem_path = "{alpha_cert}"
-private_key_pem_path = "{alpha_key}"
+private_key_provider = {{ kind = "file", pem_path = "{alpha_key}" }}
 server_names = [{{ kind = "exact", value = "alpha.example.com" }}]
 
 [[tls_certificates]]
 id = "beta"
 certificate_pem_path = "{beta_cert}"
-private_key_pem_path = "{beta_key}"
+private_key_provider = {{ kind = "file", pem_path = "{beta_key}" }}
 server_names = [{{ kind = "exact", value = "beta.example.com" }}]
 
 [default_certificate_policy]

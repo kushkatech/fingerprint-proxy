@@ -1,7 +1,7 @@
 use crate::http2::{BoxedUpstreamIo, Http2Connector, UpstreamTransport};
 use crate::http2_session::Http2SharedSession;
 use crate::ipv6::{upstream_connect_target, upstream_tls_server_name};
-use crate::ipv6_routing::{connect_tcp_with_routing, AddressFamilyPreference};
+use crate::ipv6_routing::{connect_tcp_with_routing_and_timeout, AddressFamilyPreference};
 use crate::pool::config::PoolSizeConfig;
 use crate::pool::http1::{Http1ReleaseOutcome, KeepAliveConnection};
 use crate::pool::http2::{Http2InsertOutcome, Http2PooledConnection};
@@ -12,6 +12,7 @@ use crate::{FpError, FpResult, UPSTREAM_TLS_HANDSHAKE_FAILED_MESSAGE};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub struct Http1PooledAcquire {
     io: BoxedUpstreamIo,
@@ -58,6 +59,7 @@ impl Http2SharedSessionAcquire {
 pub struct UpstreamConnectionManager {
     tls_client_config: Arc<rustls::ClientConfig>,
     http2_connector: Http2Connector,
+    connect_timeout: Option<Duration>,
     state: Arc<UpstreamConnectionManagerState>,
 }
 
@@ -70,10 +72,18 @@ struct UpstreamConnectionManagerState {
 
 impl UpstreamConnectionManager {
     pub fn new(tls_client_config: Arc<rustls::ClientConfig>) -> Self {
+        Self::new_with_connect_timeout(tls_client_config, None)
+    }
+
+    pub fn new_with_connect_timeout(
+        tls_client_config: Arc<rustls::ClientConfig>,
+        connect_timeout: Option<Duration>,
+    ) -> Self {
         Self::new_with_pooling(
             tls_client_config,
             PoolSizeConfig::default(),
             PoolTimeoutConfig::default(),
+            connect_timeout,
         )
         .expect("default pooling configuration must be valid")
     }
@@ -82,12 +92,15 @@ impl UpstreamConnectionManager {
         tls_client_config: Arc<rustls::ClientConfig>,
         size: PoolSizeConfig,
         timeouts: PoolTimeoutConfig,
+        connect_timeout: Option<Duration>,
     ) -> FpResult<Self> {
-        let http2_connector = Http2Connector::new(Arc::clone(&tls_client_config));
+        let http2_connector =
+            Http2Connector::with_connect_timeout(Arc::clone(&tls_client_config), connect_timeout);
         let pools = PerUpstreamPools::new(size, timeouts)?;
         Ok(Self {
             tls_client_config,
             http2_connector,
+            connect_timeout,
             state: Arc::new(UpstreamConnectionManagerState {
                 pool_size: size,
                 pools: Mutex::new(pools),
@@ -480,10 +493,11 @@ impl UpstreamConnectionManager {
         transport: UpstreamTransport,
     ) -> FpResult<BoxedUpstreamIo> {
         upstream_connect_target(upstream_host, upstream_port)?;
-        let tcp = connect_tcp_with_routing(
+        let tcp = connect_tcp_with_routing_and_timeout(
             upstream_host,
             upstream_port,
             AddressFamilyPreference::PreferIpv6,
+            self.connect_timeout,
         )
         .await?;
 
@@ -520,6 +534,7 @@ impl Clone for UpstreamConnectionManager {
         Self {
             tls_client_config: Arc::clone(&self.tls_client_config),
             http2_connector: self.http2_connector.clone(),
+            connect_timeout: self.connect_timeout,
             state: Arc::clone(&self.state),
         }
     }

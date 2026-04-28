@@ -1,9 +1,9 @@
 use crate::{FpError, FpResult};
 use fingerprint_proxy_core::error::ErrorKind;
 use fingerprint_proxy_http2::{
-    decode_header_block, parse_frame, parse_frame_header, serialize_frame, FlowControlError,
-    FlowController, Frame, FrameHeader, FramePayload, FrameType, HeaderBlockInput, HeaderField,
-    Settings, StreamId,
+    decode_header_block, parse_frame, parse_frame_header, parse_push_promise_promised_stream_id,
+    serialize_frame, FlowControlError, FlowController, Frame, FrameHeader, FramePayload, FrameType,
+    HeaderBlockInput, HeaderField, Settings, StreamId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -18,6 +18,7 @@ const INITIAL_CLIENT_STREAM_ID: u32 = 1;
 const MAX_STREAM_ID: u32 = 0x7fff_ffff;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const HTTP2_ERROR_CANCEL: u32 = 0x8;
 pub const HTTP2_GOAWAY_RETRYABLE_UNAVAILABLE_ERROR_PREFIX: &str =
     "HTTP/2 shared session GOAWAY rejected stream";
 pub const HTTP2_GOAWAY_RETRYABLE_UNAVAILABLE_ERROR_REASON: &str =
@@ -469,6 +470,10 @@ where
                 )
                 .await
             }
+            FramePayload::PushPromise(payload) if !frame.header.stream_id.is_connection() => {
+                self.suppress_push_promise(frame.header.flags, payload)
+                    .await
+            }
             FramePayload::WindowUpdate {
                 window_size_increment,
             } => self.apply_peer_window_update(frame.header.stream_id, *window_size_increment),
@@ -524,6 +529,20 @@ where
         )
         .await;
         Ok(())
+    }
+
+    async fn suppress_push_promise(&mut self, flags: u8, payload: &[u8]) -> FpResult<()> {
+        let promised_stream_id =
+            parse_push_promise_promised_stream_id(flags, payload).map_err(|err| {
+                FpError::invalid_protocol_data(format!(
+                    "HTTP/2 upstream PUSH_PROMISE parse error: {err}"
+                ))
+            })?;
+        write_frame(
+            &mut self.io,
+            &rst_stream_frame(promised_stream_id, HTTP2_ERROR_CANCEL),
+        )
+        .await
     }
 
     async fn handle_goaway(&mut self, last_stream_id: StreamId, error_code: u32) -> FpResult<()> {
@@ -922,6 +941,18 @@ fn window_update_frame(stream_id: StreamId, increment: u32) -> Frame {
         payload: FramePayload::WindowUpdate {
             window_size_increment: increment,
         },
+    }
+}
+
+fn rst_stream_frame(stream_id: StreamId, error_code: u32) -> Frame {
+    Frame {
+        header: FrameHeader {
+            length: 4,
+            frame_type: FrameType::RstStream,
+            flags: 0,
+            stream_id,
+        },
+        payload: FramePayload::RstStream { error_code },
     }
 }
 

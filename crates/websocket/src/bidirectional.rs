@@ -1,4 +1,6 @@
-use crate::proxy::{WebSocketProxyDirection, WebSocketProxyState, WebSocketProxyTerminalState};
+use crate::proxy::{
+    WebSocketProxyDirection, WebSocketProxyLimits, WebSocketProxyState, WebSocketProxyTerminalState,
+};
 use crate::teardown::{WebSocketConnectionTeardown, WebSocketPeer};
 use fingerprint_proxy_core::error::{FpError, FpResult};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,8 +17,31 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut client_proxy = WebSocketProxyState::new(WebSocketProxyDirection::ClientToUpstream);
-    let mut upstream_proxy = WebSocketProxyState::new(WebSocketProxyDirection::UpstreamToClient);
+    proxy_websocket_bidirectionally_with_limits(
+        client,
+        upstream,
+        initial_client_bytes,
+        initial_upstream_bytes,
+        WebSocketProxyLimits::default(),
+    )
+    .await
+}
+
+pub async fn proxy_websocket_bidirectionally_with_limits<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    initial_client_bytes: &[u8],
+    initial_upstream_bytes: &[u8],
+    limits: WebSocketProxyLimits,
+) -> FpResult<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut client_proxy =
+        WebSocketProxyState::new_with_limits(WebSocketProxyDirection::ClientToUpstream, limits);
+    let mut upstream_proxy =
+        WebSocketProxyState::new_with_limits(WebSocketProxyDirection::UpstreamToClient, limits);
     let mut teardown = WebSocketConnectionTeardown::default();
 
     if !initial_client_bytes.is_empty() {

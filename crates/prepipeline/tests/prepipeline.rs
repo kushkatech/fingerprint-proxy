@@ -89,7 +89,7 @@ fn build_request_context_sets_fingerprinting_result() {
 
     let ctx = build_request_context(pre).expect("pre-pipeline assembly should succeed");
     let result = ctx
-        .fingerprinting_result
+        .fingerprinting_result()
         .expect("fingerprinting_result must be set before pipeline");
 
     assert_eq!(
@@ -127,7 +127,7 @@ fn missing_inputs_are_represented_by_unavailable_result() {
 
     let ctx = build_request_context(pre).expect("pre-pipeline assembly should succeed");
     let result = ctx
-        .fingerprinting_result
+        .fingerprinting_result()
         .expect("fingerprinting_result must be present even when inputs are missing");
 
     assert_eq!(
@@ -175,14 +175,10 @@ fn determinism_same_input_same_result() {
         ),
     };
 
-    let a = build_request_context(pre.clone())
-        .expect("pre-pipeline assembly should succeed")
-        .fingerprinting_result
-        .expect("result present");
-    let b = build_request_context(pre)
-        .expect("pre-pipeline assembly should succeed")
-        .fingerprinting_result
-        .expect("result present");
+    let a_ctx = build_request_context(pre.clone()).expect("pre-pipeline assembly should succeed");
+    let b_ctx = build_request_context(pre).expect("pre-pipeline assembly should succeed");
+    let a = a_ctx.fingerprinting_result().expect("result present");
+    let b = b_ctx.fingerprinting_result().expect("result present");
 
     assert_eq!(a, b);
 }

@@ -1,7 +1,7 @@
 use fingerprint_proxy_bootstrap_config::config::{
-    CertificateRef, DomainConfig, FingerprintHeaderConfig, ServerNamePattern, UpstreamConfig,
-    UpstreamProtocol, VirtualHostConfig, VirtualHostMatch, VirtualHostProtocolConfig,
-    VirtualHostTlsConfig,
+    CertificateRef, DomainConfig, FingerprintHeaderConfig, Http2ServerPushPolicy,
+    ServerNamePattern, UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
+    VirtualHostProtocolConfig, VirtualHostTlsConfig,
 };
 use fingerprint_proxy_bootstrap_config::dynamic::upstream_check::{
     validate_candidate_upstream_connectivity, UpstreamConnectivityChecker,
@@ -43,6 +43,7 @@ fn domain_config(version: &str, upstream_hosts: &[&str]) -> DomainConfig {
                     allow_http1: true,
                     allow_http2: true,
                     allow_http3: false,
+                    http2_server_push_policy: Http2ServerPushPolicy::Suppress,
                 },
                 module_config: BTreeMap::new(),
             })

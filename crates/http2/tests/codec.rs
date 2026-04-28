@@ -1,6 +1,6 @@
 use fingerprint_proxy_http2::frames::{
-    parse_frame, parse_frame_header, serialize_frame, serialize_frame_header, Frame, FrameHeader,
-    FramePayload, FrameType, Http2FrameError,
+    parse_frame, parse_frame_header, parse_push_promise_promised_stream_id, serialize_frame,
+    serialize_frame_header, Frame, FrameHeader, FramePayload, FrameType, Http2FrameError,
 };
 use fingerprint_proxy_http2::settings::{Setting, Settings};
 use fingerprint_proxy_http2::streams::StreamId;
@@ -184,6 +184,33 @@ fn rst_stream_requires_length_4() {
         err,
         Http2FrameError::InvalidRstStreamPayloadLength { actual: 5 }
     );
+}
+
+#[test]
+fn push_promise_promised_stream_id_is_parsed_deterministically() {
+    let promised = parse_push_promise_promised_stream_id(0x4, &[0, 0, 0, 2, 0x82])
+        .expect("parse promised stream id");
+    assert_eq!(promised, sid(2));
+}
+
+#[test]
+fn push_promise_promised_stream_id_rejects_invalid_payload() {
+    let err = parse_push_promise_promised_stream_id(0x4, &[0, 0, 0]).expect_err("short payload");
+    assert_eq!(
+        err,
+        Http2FrameError::InvalidPushPromisePayloadLength { actual: 3 }
+    );
+
+    let err =
+        parse_push_promise_promised_stream_id(0x4, &[0x80, 0, 0, 2]).expect_err("reserved bit");
+    assert_eq!(
+        err,
+        Http2FrameError::ReservedBitSetInPushPromisePromisedStreamId
+    );
+
+    let err = parse_push_promise_promised_stream_id(0x4, &[0, 0, 0, 0])
+        .expect_err("zero promised stream");
+    assert_eq!(err, Http2FrameError::InvalidPushPromisePromisedStreamId);
 }
 
 #[test]

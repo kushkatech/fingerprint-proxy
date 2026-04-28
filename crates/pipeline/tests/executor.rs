@@ -2,7 +2,7 @@ use fingerprint_proxy_core::connection::TransportProtocol;
 use fingerprint_proxy_core::enrichment::{ModuleDecision, ProcessingStage};
 use fingerprint_proxy_core::error::{FpError, FpResult};
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::HttpRequest;
+use fingerprint_proxy_core::request::{HttpRequest, PipelineModuleContext};
 use fingerprint_proxy_core::{ConnectionContext, RequestContext};
 use fingerprint_proxy_pipeline::executor::PipelineTraceOutcome;
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
@@ -27,7 +27,7 @@ impl PipelineModule for SetHeaderModule {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         ctx.request
             .headers
             .insert(self.key.to_string(), self.value.to_string());
@@ -50,7 +50,7 @@ impl PipelineModule for RequireHeaderModule {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         if !ctx.request.headers.contains_key(self.required_key) {
             return Err(FpError::internal(format!(
                 "missing required header: {}",
@@ -76,7 +76,7 @@ impl PipelineModule for StopModule {
         self.deps
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, self.status);
         Ok(ModuleDecision::Terminate)
     }
@@ -96,7 +96,7 @@ impl PipelineModule for ErrorModule {
         self.deps
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Err(FpError::internal("boom"))
     }
 }

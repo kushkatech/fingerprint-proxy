@@ -1,6 +1,6 @@
 use fingerprint_proxy_core::error::FpError;
 use fingerprint_proxy_core::request::HttpRequest;
-use fingerprint_proxy_http1::request::{parse_http1_request, ParseOptions};
+use fingerprint_proxy_http1::request::{parse_http1_request, Http1ParseError, ParseOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssemblerInput<'a> {
@@ -12,7 +12,56 @@ pub enum AssemblerInput<'a> {
 pub enum AssemblerEvent {
     NeedMoreData,
     RequestReady(HttpRequest),
+    ClientError(ClientRequestError),
     Error(FpError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientRequestErrorStatus {
+    BadRequest,
+    PayloadTooLarge,
+    UriTooLong,
+    RequestHeadersTooLarge,
+}
+
+impl ClientRequestErrorStatus {
+    pub fn status_code(self) -> u16 {
+        match self {
+            ClientRequestErrorStatus::BadRequest => 400,
+            ClientRequestErrorStatus::PayloadTooLarge => 413,
+            ClientRequestErrorStatus::UriTooLong => 414,
+            ClientRequestErrorStatus::RequestHeadersTooLarge => 431,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRequestError {
+    pub status: ClientRequestErrorStatus,
+    pub message: String,
+}
+
+impl ClientRequestError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: ClientRequestErrorStatus::BadRequest,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: ClientRequestErrorStatus::PayloadTooLarge,
+            message: message.into(),
+        }
+    }
+
+    fn request_headers_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: ClientRequestErrorStatus::RequestHeadersTooLarge,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +139,9 @@ impl Http1MessageAssembler {
         match input {
             AssemblerInput::Bytes(bytes) => {
                 if matches!(self.state, AssemblerState::Closed) {
-                    events.push(AssemblerEvent::Error(FpError::invalid_protocol_data(
-                        "HTTP/1 connection is closed",
-                    )));
+                    events.push(AssemblerEvent::ClientError(
+                        ClientRequestError::bad_request("HTTP/1 connection is closed"),
+                    ));
                     return events;
                 }
                 self.buffer.extend_from_slice(bytes);
@@ -128,7 +177,7 @@ impl Http1MessageAssembler {
                     }
                     Err(e) => {
                         self.state = AssemblerState::Closed;
-                        events.push(AssemblerEvent::Error(e));
+                        events.push(AssemblerEvent::ClientError(e));
                         break;
                     }
                 },
@@ -157,7 +206,7 @@ impl Http1MessageAssembler {
                     }
                     Err(e) => {
                         self.state = AssemblerState::Closed;
-                        events.push(AssemblerEvent::Error(e));
+                        events.push(AssemblerEvent::ClientError(e));
                         break;
                     }
                 },
@@ -186,7 +235,7 @@ impl Http1MessageAssembler {
                     }
                     Err(e) => {
                         self.state = AssemblerState::Closed;
-                        events.push(AssemblerEvent::Error(e));
+                        events.push(AssemblerEvent::ClientError(e));
                         break;
                     }
                 },
@@ -211,7 +260,7 @@ impl Http1MessageAssembler {
                         }
                         Err(e) => {
                             self.state = AssemblerState::Closed;
-                            events.push(AssemblerEvent::Error(e));
+                            events.push(AssemblerEvent::ClientError(e));
                             break;
                         }
                     }
@@ -248,33 +297,35 @@ enum UntilEofStep {
     RequestReady(HttpRequest),
 }
 
+type ClientRequestResult<T> = Result<T, ClientRequestError>;
+
 fn step_reading_headers(
     buffer: &mut Vec<u8>,
     saw_eof: bool,
     requests_emitted: usize,
     limits: Limits,
-) -> Result<ReadingStep, FpError> {
+) -> ClientRequestResult<ReadingStep> {
     if requests_emitted >= limits.max_requests_per_connection {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::bad_request(
             "HTTP/1 max_requests_per_connection exceeded",
         ));
     }
 
     if buffer.len() > limits.max_header_bytes && find_headers_end(buffer).is_none() {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::request_headers_too_large(
             "HTTP/1 header bytes exceed max_header_bytes",
         ));
     }
 
     if contains_invalid_header_line_endings(buffer) {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::bad_request(
             "HTTP/1 invalid line endings (CRLF required)",
         ));
     }
 
     let Some(header_end) = find_headers_end(buffer) else {
         if saw_eof {
-            return Err(FpError::invalid_protocol_data(
+            return Err(ClientRequestError::bad_request(
                 "HTTP/1 unexpected EOF before headers complete",
             ));
         }
@@ -283,7 +334,7 @@ fn step_reading_headers(
 
     let header_block_len = header_end + 4;
     if header_block_len > limits.max_header_bytes {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::request_headers_too_large(
             "HTTP/1 header bytes exceed max_header_bytes",
         ));
     }
@@ -297,7 +348,7 @@ fn step_reading_headers(
             max_header_bytes: Some(limits.max_header_bytes),
         },
     )
-    .map_err(|e| FpError::invalid_protocol_data(format!("HTTP/1 parse error: {e:?}")))?;
+    .map_err(map_http1_parse_error)?;
 
     let transfer_encoding = get_header_value_ci(&req.headers, "transfer-encoding");
     let content_length = get_header_value_ci(&req.headers, "content-length");
@@ -308,7 +359,7 @@ fn step_reading_headers(
     };
 
     if is_chunked && content_length.is_some() {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::bad_request(
             "HTTP/1 request must not include both transfer-encoding and content-length",
         ));
     }
@@ -328,7 +379,7 @@ fn step_reading_headers(
 
     if let Some(len) = content_length {
         if len > limits.max_body_bytes {
-            return Err(FpError::invalid_protocol_data(
+            return Err(ClientRequestError::payload_too_large(
                 "HTTP/1 content-length exceeds max_body_bytes",
             ));
         }
@@ -363,10 +414,10 @@ fn step_reading_content_length(
     mut request: HttpRequest,
     mut remaining: usize,
     mut body: Vec<u8>,
-) -> Result<BodyStep, FpError> {
+) -> ClientRequestResult<BodyStep> {
     if buffer.is_empty() {
         if saw_eof {
-            return Err(FpError::invalid_protocol_data(
+            return Err(ClientRequestError::bad_request(
                 "HTTP/1 unexpected EOF before content-length body complete",
             ));
         }
@@ -379,7 +430,7 @@ fn step_reading_content_length(
 
     let take = remaining.min(buffer.len());
     if body.len() + take > limits.max_body_bytes {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::payload_too_large(
             "HTTP/1 body exceeds max_body_bytes",
         ));
     }
@@ -389,7 +440,7 @@ fn step_reading_content_length(
 
     if remaining > 0 {
         if saw_eof {
-            return Err(FpError::invalid_protocol_data(
+            return Err(ClientRequestError::bad_request(
                 "HTTP/1 unexpected EOF before content-length body complete",
             ));
         }
@@ -411,18 +462,18 @@ fn step_reading_chunked(
     mut request: HttpRequest,
     mut state: ChunkedState,
     mut body: Vec<u8>,
-) -> Result<BodyStep, FpError> {
+) -> ClientRequestResult<BodyStep> {
     loop {
         match state {
             ChunkedState::SizeLine => {
                 if contains_invalid_header_line_endings(buffer) {
-                    return Err(FpError::invalid_protocol_data(
+                    return Err(ClientRequestError::bad_request(
                         "HTTP/1 invalid line endings (CRLF required)",
                     ));
                 }
                 let Some(line_end) = find_crlf(buffer) else {
                     if saw_eof {
-                        return Err(FpError::invalid_protocol_data(
+                        return Err(ClientRequestError::bad_request(
                             "HTTP/1 unexpected EOF in chunk size line",
                         ));
                     }
@@ -442,7 +493,7 @@ fn step_reading_chunked(
                 }
 
                 if body.len() + size > limits.max_body_bytes {
-                    return Err(FpError::invalid_protocol_data(
+                    return Err(ClientRequestError::payload_too_large(
                         "HTTP/1 body exceeds max_body_bytes",
                     ));
                 }
@@ -452,7 +503,7 @@ fn step_reading_chunked(
             ChunkedState::Data { remaining } => {
                 if buffer.len() < remaining {
                     if saw_eof {
-                        return Err(FpError::invalid_protocol_data(
+                        return Err(ClientRequestError::bad_request(
                             "HTTP/1 unexpected EOF in chunk data",
                         ));
                     }
@@ -469,7 +520,7 @@ fn step_reading_chunked(
             ChunkedState::DataCrlf => {
                 if buffer.len() < 2 {
                     if saw_eof {
-                        return Err(FpError::invalid_protocol_data(
+                        return Err(ClientRequestError::bad_request(
                             "HTTP/1 unexpected EOF after chunk data",
                         ));
                     }
@@ -480,7 +531,7 @@ fn step_reading_chunked(
                     }));
                 }
                 if buffer[0] != b'\r' || buffer[1] != b'\n' {
-                    return Err(FpError::invalid_protocol_data(
+                    return Err(ClientRequestError::bad_request(
                         "HTTP/1 invalid chunk: missing CRLF after data",
                     ));
                 }
@@ -489,13 +540,13 @@ fn step_reading_chunked(
             }
             ChunkedState::Trailers => {
                 if contains_invalid_header_line_endings(buffer) {
-                    return Err(FpError::invalid_protocol_data(
+                    return Err(ClientRequestError::bad_request(
                         "HTTP/1 invalid line endings (CRLF required)",
                     ));
                 }
                 let Some(end) = find_headers_end(buffer) else {
                     if saw_eof {
-                        return Err(FpError::invalid_protocol_data(
+                        return Err(ClientRequestError::bad_request(
                             "HTTP/1 unexpected EOF in chunked trailers",
                         ));
                     }
@@ -523,11 +574,11 @@ fn step_reading_until_eof(
     limits: Limits,
     mut request: HttpRequest,
     mut body: Vec<u8>,
-) -> Result<UntilEofStep, FpError> {
+) -> ClientRequestResult<UntilEofStep> {
     if !buffer.is_empty() {
         let remaining = limits.max_body_bytes.saturating_sub(body.len());
         if buffer.len() > remaining {
-            return Err(FpError::invalid_protocol_data(
+            return Err(ClientRequestError::payload_too_large(
                 "HTTP/1 close-delimited body exceeds max_body_bytes",
             ));
         }
@@ -573,25 +624,25 @@ fn get_header_value_ci<'a>(
         .map(|(_, v)| v.as_str())
 }
 
-fn parse_content_length(value: &str) -> Result<usize, FpError> {
+fn parse_content_length(value: &str) -> ClientRequestResult<usize> {
     let v = value.trim();
     if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::bad_request(
             "HTTP/1 invalid content-length",
         ));
     }
     v.parse::<usize>()
-        .map_err(|_| FpError::invalid_protocol_data("HTTP/1 invalid content-length"))
+        .map_err(|_| ClientRequestError::bad_request("HTTP/1 invalid content-length"))
 }
 
-fn is_transfer_encoding_chunked(value: &str) -> Result<bool, FpError> {
+fn is_transfer_encoding_chunked(value: &str) -> ClientRequestResult<bool> {
     let tokens: Vec<&str> = value
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
     if tokens.is_empty() {
-        return Err(FpError::invalid_protocol_data(
+        return Err(ClientRequestError::bad_request(
             "HTTP/1 invalid transfer-encoding",
         ));
     }
@@ -599,21 +650,21 @@ fn is_transfer_encoding_chunked(value: &str) -> Result<bool, FpError> {
     if lower.iter().any(|t| t == "chunked") {
         return Ok(true);
     }
-    Err(FpError::invalid_protocol_data(
+    Err(ClientRequestError::bad_request(
         "HTTP/1 unsupported transfer-encoding",
     ))
 }
 
-fn parse_chunk_size_line(line: &[u8]) -> Result<usize, FpError> {
+fn parse_chunk_size_line(line: &[u8]) -> ClientRequestResult<usize> {
     let s = std::str::from_utf8(line)
-        .map_err(|_| FpError::invalid_protocol_data("HTTP/1 invalid chunk size line"))?;
+        .map_err(|_| ClientRequestError::bad_request("HTTP/1 invalid chunk size line"))?;
     let (size_part, _) = s.split_once(';').unwrap_or((s, ""));
     let size_part = size_part.trim();
     if size_part.is_empty() {
-        return Err(FpError::invalid_protocol_data("HTTP/1 invalid chunk size"));
+        return Err(ClientRequestError::bad_request("HTTP/1 invalid chunk size"));
     }
     usize::from_str_radix(size_part, 16)
-        .map_err(|_| FpError::invalid_protocol_data("HTTP/1 invalid chunk size"))
+        .map_err(|_| ClientRequestError::bad_request("HTTP/1 invalid chunk size"))
 }
 
 fn method_allows_close_delimited_body(method: &str) -> bool {
@@ -626,7 +677,7 @@ fn method_allows_close_delimited_body(method: &str) -> bool {
 fn parse_http1_trailers(
     trailer_section: &[u8],
     max_header_bytes: usize,
-) -> Result<std::collections::BTreeMap<String, String>, FpError> {
+) -> ClientRequestResult<std::collections::BTreeMap<String, String>> {
     let mut synthetic = Vec::with_capacity(b"GET / HTTP/1.1\r\n".len() + trailer_section.len());
     synthetic.extend_from_slice(b"GET / HTTP/1.1\r\n");
     synthetic.extend_from_slice(trailer_section);
@@ -637,7 +688,25 @@ fn parse_http1_trailers(
             max_header_bytes: Some(max_header_bytes),
         },
     )
-    .map_err(|e| FpError::invalid_protocol_data(format!("HTTP/1 trailer parse error: {e:?}")))?;
+    .map_err(map_http1_trailer_parse_error)?;
 
     Ok(parsed.headers)
+}
+
+fn map_http1_parse_error(error: Http1ParseError) -> ClientRequestError {
+    match error {
+        Http1ParseError::HeaderTooLarge { .. } => {
+            ClientRequestError::request_headers_too_large(format!("HTTP/1 parse error: {error:?}"))
+        }
+        _ => ClientRequestError::bad_request(format!("HTTP/1 parse error: {error:?}")),
+    }
+}
+
+fn map_http1_trailer_parse_error(error: Http1ParseError) -> ClientRequestError {
+    match error {
+        Http1ParseError::HeaderTooLarge { .. } => ClientRequestError::request_headers_too_large(
+            format!("HTTP/1 trailer parse error: {error:?}"),
+        ),
+        _ => ClientRequestError::bad_request(format!("HTTP/1 trailer parse error: {error:?}")),
+    }
 }

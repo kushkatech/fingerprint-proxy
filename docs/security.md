@@ -13,10 +13,26 @@ It is non-normative; the active specification and ADRs remain authoritative.
 
 Operational guidance:
 
-- keep certificate and private-key files readable only by the service user;
+- configure certificate private keys through the explicit
+  `private_key_provider` block;
+- for the `file` private-key provider, keep private-key files readable only by
+  the service user;
+- PKCS#11, KMS, and TPM provider kinds are recognized as unsupported and fail
+  validation deterministically until real signing backends are implemented
+  under `T328`;
 - avoid permissive default certificate policies unless required;
 - prefer TLS 1.3 where client compatibility allows it;
 - rotate certificates through controlled deployment/configuration procedures.
+
+Current implementation status:
+
+- the `private_key_provider` configuration boundary is implemented;
+- `private_key_provider = { kind = "file", pem_path = "..." }` is the only
+  implemented private-key provider and loads PEM private keys from the local
+  filesystem into the existing TLS runtime path;
+- `pkcs11`, `kms`, and `tpm` are not real provider-backed/HSM signing backends
+  yet, are not production-ready key-storage integrations, and remain tracked by
+  `T328`.
 
 ## Protocol Safety
 
@@ -92,5 +108,7 @@ Future hardening should focus on:
 
 - QUIC/HTTP3 security review when Phase 22 is implemented;
 - production benchmark and load-test results;
+- real PKCS#11/KMS/TPM/HSM TLS private-key signing backends behind the current
+  provider boundary;
 - operational secret-management guidance for certificates and bearer tokens;
 - public release packaging and dependency audit.

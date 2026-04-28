@@ -28,9 +28,12 @@ fn api_provider_skeleton_load_is_deterministic_via_provider_interface() {
     });
     let err = (&configured as &dyn ConfigProvider)
         .load()
-        .expect_err("configured api provider skeleton must still fail explicitly");
+        .expect_err("configured api provider must still fail explicitly");
     assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
-    assert_eq!(err.message, "api config provider skeleton is unimplemented");
+    assert_eq!(
+        err.message,
+        "api config provider is unsupported in this build; active runtime dynamic configuration supports only file providers"
+    );
 }
 
 #[test]
@@ -73,11 +76,11 @@ fn database_provider_skeleton_load_is_deterministic_via_provider_interface() {
     });
     let err = (&configured as &dyn ConfigProvider)
         .load()
-        .expect_err("configured database provider skeleton must still fail explicitly");
+        .expect_err("configured database provider must still fail explicitly");
     assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
     assert_eq!(
         err.message,
-        "database config provider skeleton is unimplemented"
+        "database config provider is unsupported in this build; active runtime dynamic configuration supports only file providers"
     );
 }
 

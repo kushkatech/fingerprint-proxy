@@ -15,6 +15,7 @@ use tokio::time::timeout;
 const FLAG_ACK: u8 = 0x1;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
+const HTTP2_ERROR_CANCEL: u32 = 0x8;
 
 #[tokio::test]
 async fn concurrent_leases_share_session_and_route_out_of_order_responses() {
@@ -349,6 +350,67 @@ async fn settings_and_ping_are_acked_by_owner_task() {
         } if returned == opaque
     ));
 
+    drop(server_io);
+    owner.await.expect("owner task");
+}
+
+#[tokio::test]
+async fn upstream_push_promise_is_suppressed_with_rst_stream_cancel() {
+    let (client_io, mut server_io) = duplex(4096);
+    let (session, owner) = Http2SharedSession::spawn(
+        client_io,
+        Http2SharedSessionConfig::new(2, 8, 4).expect("config"),
+    )
+    .expect("spawn session");
+
+    let mut lease = session.lease_stream().await.expect("lease");
+    lease
+        .submit_frame(headers_frame(lease.stream_id(), b"request", true))
+        .await
+        .expect("send request");
+    let upstream_request = read_test_frame(&mut server_io).await.expect("request");
+    assert_eq!(upstream_request.header.stream_id, lease.stream_id());
+
+    let promised_stream_id = StreamId::new(2).expect("promised stream");
+    write_test_frame(
+        &mut server_io,
+        &push_promise_frame(lease.stream_id(), promised_stream_id),
+    )
+    .await
+    .expect("push promise");
+
+    let rst = read_test_frame(&mut server_io)
+        .await
+        .expect("suppression rst stream");
+    assert_eq!(rst.header.frame_type, FrameType::RstStream);
+    assert_eq!(rst.header.stream_id, promised_stream_id);
+    assert_eq!(
+        rst.payload,
+        FramePayload::RstStream {
+            error_code: HTTP2_ERROR_CANCEL,
+        }
+    );
+    assert!(
+        timeout(Duration::from_millis(100), lease.recv_response_event())
+            .await
+            .is_err(),
+        "PUSH_PROMISE suppression must not route a response event"
+    );
+
+    write_test_frame(
+        &mut server_io,
+        &response_headers_frame(lease.stream_id(), "response", true),
+    )
+    .await
+    .expect("response after suppressed push");
+    let response = lease
+        .recv_response_event()
+        .await
+        .expect("response")
+        .expect("response ok");
+    assert_response_header_value(&response, "x-test", "response", true);
+
+    drop(session);
     drop(server_io);
     owner.await.expect("owner task");
 }
@@ -1189,6 +1251,20 @@ fn ping_frame(opaque: [u8; 8]) -> Frame {
             stream_id: StreamId::connection(),
         },
         payload: FramePayload::Ping { ack: false, opaque },
+    }
+}
+
+fn push_promise_frame(stream_id: StreamId, promised_stream_id: StreamId) -> Frame {
+    let mut payload = promised_stream_id.as_u32().to_be_bytes().to_vec();
+    payload.extend_from_slice(b"push-headers");
+    Frame {
+        header: FrameHeader {
+            length: payload.len() as u32,
+            frame_type: FrameType::PushPromise,
+            flags: FLAG_END_HEADERS,
+            stream_id,
+        },
+        payload: FramePayload::PushPromise(payload),
     }
 }
 

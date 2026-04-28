@@ -63,6 +63,18 @@ fn prepare_grpc_forward_request_preserves_grpc_headers_and_trailers() {
 }
 
 #[test]
+fn prepare_grpc_forward_request_does_not_require_complete_grpc_frame_buffer() {
+    let mut request = HttpRequest::new("POST", "/svc.Method", "HTTP/2");
+    request
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    request.body = vec![0, 0, 0];
+
+    let forwarded = prepare_grpc_forward_request(&request).expect("transparent request");
+    assert_eq!(forwarded.body, request.body);
+}
+
+#[test]
 fn finalize_grpc_forward_response_requires_grpc_content_type() {
     let response = HttpResponse {
         version: "HTTP/2".to_string(),
@@ -112,4 +124,21 @@ fn finalize_grpc_forward_response_preserves_grpc_trailers() {
         forwarded.trailers.get("grpc-status").map(String::as_str),
         Some("0")
     );
+}
+
+#[test]
+fn finalize_grpc_forward_response_does_not_require_complete_grpc_frame_buffer() {
+    let mut response = HttpResponse {
+        version: "HTTP/2".to_string(),
+        status: Some(200),
+        headers: Default::default(),
+        trailers: Default::default(),
+        body: vec![0, 0, 0],
+    };
+    response
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+
+    let forwarded = finalize_grpc_forward_response(&response).expect("transparent response");
+    assert_eq!(forwarded.body, response.body);
 }

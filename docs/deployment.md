@@ -17,6 +17,19 @@ export FP_DOMAIN_CONFIG_PATH=/etc/fingerprint-proxy/domain.toml
 points to the file-backed dynamic domain configuration used by the current
 provider implementation.
 
+TLS private keys are configured through the bootstrap
+`private_key_provider` block. The current runtime implements only the local
+file provider:
+
+```toml
+private_key_provider = { kind = "file", pem_path = "/etc/fingerprint-proxy/tls.key" }
+```
+
+Keep file-provider private-key files readable only by the service user.
+`pkcs11`, `kms`, and `tpm` provider kinds are recognized but rejected
+deterministically; real provider-backed/HSM signing backends remain open under
+`T328`.
+
 ## Linux Runtime Contract
 
 `fingerprint-proxy` is a Linux-only runtime. Complete `JA4T` runtime support
@@ -117,6 +130,30 @@ Saved-SYN `JA4T` capture is still attempted in this mode by enabling
 Compatibility of this mechanism with all socket-activation handoff cases is not
 guaranteed by this slice and should be validated separately.
 
+## HTTP/3 QUIC Listener Policy
+
+HTTP/3 over QUIC remains a required compliance target, but end-to-end runtime
+forwarding is still open under `T291` via `T308`-`T310`. UDP/QUIC listeners are
+therefore disabled by default.
+
+For safe production deployments that do not require the current experimental
+QUIC boundary, leave bootstrap `enable_http3_quic_listeners = false` and keep
+each effective virtual host at `allow_http3 = false`. In this disabled state,
+the runtime does not bind UDP sockets, so UDP bind failures cannot affect
+HTTP/1 or HTTP/2 listener startup.
+
+When explicitly exercising HTTP/3 listener acquisition in `direct_bind` mode,
+bootstrap `enable_http3_quic_listeners = true` must be paired with at least one
+effective virtual host using `allow_http3 = true`. Mismatched configurations
+are validation errors: a virtual host cannot allow HTTP/3 while bootstrap
+QUIC listeners are disabled, and bootstrap QUIC listeners cannot be enabled
+when no virtual host allows HTTP/3.
+
+`enable_http3_quic_listeners = true` is rejected with
+`listener_acquisition_mode = "inherited_systemd"` because inherited UDP sockets
+are not supported. HTTP/3 traffic is not downgraded, translated, or failed over
+to HTTP/1 or HTTP/2.
+
 ## Health Endpoints
 
 Health endpoints are served on the main HTTPS listener:
@@ -127,6 +164,16 @@ Health endpoints are served on the main HTTPS listener:
 
 Use `/health/ready` for Kubernetes readiness probes and load-balancer removal
 decisions. Use `/health/live` for liveness probes.
+
+## HTTP/2 Server Push Policy
+
+Domain virtual-host protocol configuration supports
+`http2_server_push_policy`. The default and only supported runtime value is
+`suppress`. Upstream origin `PUSH_PROMISE` frames are cancelled with
+`RST_STREAM CANCEL`; client-originated `PUSH_PROMISE` frames are rejected as
+invalid HTTP/2 protocol data.
+
+`forward` is reserved for a future slice and fails validation deterministically.
 
 ## Configuration Examples
 

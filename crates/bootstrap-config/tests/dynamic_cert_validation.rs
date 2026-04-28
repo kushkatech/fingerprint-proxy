@@ -3,10 +3,11 @@ use fingerprint_proxy_bootstrap_config::certificates::{
 };
 use fingerprint_proxy_bootstrap_config::config::{
     BootstrapConfig, CertificateRef, DefaultCertificatePolicy, DomainConfig,
-    FingerprintHeaderConfig, ListenerAcquisitionMode, ListenerConfig, ServerNamePattern,
-    StatsApiAuthPolicy, StatsApiConfig, StatsApiNetworkPolicy, SystemLimits, SystemTimeouts,
-    TlsCertificateConfig, UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
-    VirtualHostProtocolConfig, VirtualHostTlsConfig,
+    FingerprintHeaderConfig, FingerprintingConfig, Http2ServerPushPolicy, ListenerAcquisitionMode,
+    ListenerConfig, ServerNamePattern, StatsApiAuthPolicy, StatsApiConfig, StatsApiNetworkPolicy,
+    SystemLimits, SystemTimeouts, TlsCertificateConfig, TlsPrivateKeyFileProviderConfig,
+    TlsPrivateKeyProviderConfig, UpstreamConfig, UpstreamProtocol, VirtualHostConfig,
+    VirtualHostMatch, VirtualHostProtocolConfig, VirtualHostTlsConfig,
 };
 use fingerprint_proxy_bootstrap_config::dynamic::cert_validation::{
     validate_candidate_certificate_references, validate_retrieved_candidate_certificate_references,
@@ -54,6 +55,12 @@ fn generate_leaf(ca: &rcgen::Certificate, names: Vec<&str>) -> (String, String) 
     (cert_pem, key_pem)
 }
 
+fn file_private_key_provider(path: impl Into<String>) -> TlsPrivateKeyProviderConfig {
+    TlsPrivateKeyProviderConfig::File(TlsPrivateKeyFileProviderConfig {
+        pem_path: path.into(),
+    })
+}
+
 fn loaded_tls_certificates(cert_id: &str) -> LoadedTlsCertificates {
     let ca = generate_ca();
     let (cert_pem, key_pem) = generate_leaf(&ca, vec!["dynamic.example.com"]);
@@ -62,13 +69,15 @@ fn loaded_tls_certificates(cert_id: &str) -> LoadedTlsCertificates {
 
     let bootstrap = BootstrapConfig {
         listener_acquisition_mode: ListenerAcquisitionMode::DirectBind,
+        enable_http3_quic_listeners: false,
+        fingerprinting: FingerprintingConfig::default(),
         listeners: vec![ListenerConfig {
             bind: "127.0.0.1:0".parse().expect("bind"),
         }],
         tls_certificates: vec![TlsCertificateConfig {
             id: cert_id.to_string(),
             certificate_pem_path: cert_path.to_string_lossy().to_string(),
-            private_key_pem_path: key_path.to_string_lossy().to_string(),
+            private_key_provider: file_private_key_provider(key_path.to_string_lossy().to_string()),
             server_names: vec![ServerNamePattern::Exact("dynamic.example.com".to_string())],
         }],
         default_certificate_policy: DefaultCertificatePolicy::UseDefault(CertificateRef {
@@ -121,6 +130,7 @@ fn domain_config_with_cert(version: &str, cert_id: &str) -> DomainConfig {
                 allow_http1: true,
                 allow_http2: true,
                 allow_http3: false,
+                http2_server_push_policy: Http2ServerPushPolicy::Suppress,
             },
             module_config: BTreeMap::new(),
         }],

@@ -1,6 +1,6 @@
-use fingerprint_proxy_core::error::ErrorKind;
 use fingerprint_proxy_http1_orchestrator::{
-    AssemblerEvent, AssemblerInput, Http1MessageAssembler, Limits,
+    AssemblerEvent, AssemblerInput, ClientRequestError, ClientRequestErrorStatus,
+    Http1MessageAssembler, Limits,
 };
 
 fn take_ready(events: Vec<AssemblerEvent>) -> Option<fingerprint_proxy_core::request::HttpRequest> {
@@ -10,9 +10,9 @@ fn take_ready(events: Vec<AssemblerEvent>) -> Option<fingerprint_proxy_core::req
     })
 }
 
-fn take_error(events: Vec<AssemblerEvent>) -> Option<fingerprint_proxy_core::error::FpError> {
+fn take_client_error(events: Vec<AssemblerEvent>) -> Option<ClientRequestError> {
     events.into_iter().find_map(|e| match e {
-        AssemblerEvent::Error(err) => Some(err),
+        AssemblerEvent::ClientError(err) => Some(err),
         _ => None,
     })
 }
@@ -145,8 +145,8 @@ fn invalid_chunked_syntax_is_invalid_protocol_data() {
         ),
         limits,
     );
-    let err = take_error(ev).expect("error");
-    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    let err = take_client_error(ev).expect("error");
+    assert_eq!(err.status, ClientRequestErrorStatus::BadRequest);
 }
 
 #[test]
@@ -158,6 +158,6 @@ fn lf_only_line_endings_are_rejected() {
         AssemblerInput::Bytes(b"GET / HTTP/1.1\nHost: example.com\n\n"),
         limits,
     );
-    let err = take_error(ev).expect("error");
-    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    let err = take_client_error(ev).expect("error");
+    assert_eq!(err.status, ClientRequestErrorStatus::BadRequest);
 }

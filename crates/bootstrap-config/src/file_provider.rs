@@ -1,7 +1,10 @@
 use crate::config::{
     BootstrapConfig, Cidr, Credential, DefaultCertificatePolicy, DynamicConfigProviderSettings,
-    ListenerAcquisitionMode, ListenerConfig, StatsApiAuthPolicy, StatsApiConfig,
-    StatsApiNetworkPolicy, SystemLimits, SystemTimeouts, DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+    FingerprintingConfig, Ja4TConfig, Ja4TMissingTcpMetadataPolicy, ListenerAcquisitionMode,
+    ListenerConfig, StatsApiAuthPolicy, StatsApiConfig, StatsApiNetworkPolicy, SystemLimits,
+    SystemTimeouts, TlsPrivateKeyFileProviderConfig, TlsPrivateKeyKnownUnsupportedProviderKind,
+    TlsPrivateKeyProviderConfig, TlsPrivateKeyUnknownProviderConfig,
+    DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
 };
 use crate::dynamic::upstream_check::UpstreamConnectivityValidationMode;
 use crate::provider::ConfigProvider;
@@ -98,6 +101,12 @@ struct BootstrapConfigFile {
     listener_acquisition_mode: ListenerAcquisitionModeFile,
 
     #[serde(default)]
+    enable_http3_quic_listeners: bool,
+
+    #[serde(default)]
+    fingerprinting: FingerprintingConfigFile,
+
+    #[serde(default)]
     listeners: Vec<ListenerConfigFile>,
 
     #[serde(default)]
@@ -130,6 +139,26 @@ enum ListenerAcquisitionModeFile {
     InheritedSystemd,
 }
 
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct FingerprintingConfigFile {
+    ja4t: Ja4TConfigFile,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(default)]
+struct Ja4TConfigFile {
+    missing_tcp_metadata_policy: Ja4TMissingTcpMetadataPolicyFile,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum Ja4TMissingTcpMetadataPolicyFile {
+    #[default]
+    FailStartup,
+    AllowUnavailable,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ListenerConfigFile {
     bind: SocketAddr,
@@ -139,9 +168,16 @@ struct ListenerConfigFile {
 struct TlsCertificateConfigFile {
     id: String,
     certificate_pem_path: String,
-    private_key_pem_path: String,
+    private_key_provider: TlsPrivateKeyProviderConfigFile,
     #[serde(default)]
     server_names: Vec<ServerNamePatternFile>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TlsPrivateKeyProviderConfigFile {
+    kind: String,
+    #[serde(default)]
+    pem_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -304,6 +340,23 @@ fn parse_bootstrap_config_toml(raw: &str, source: &str) -> FpResult<BootstrapCon
                 ListenerAcquisitionMode::InheritedSystemd
             }
         },
+        enable_http3_quic_listeners: file.enable_http3_quic_listeners,
+        fingerprinting: FingerprintingConfig {
+            ja4t: Ja4TConfig {
+                missing_tcp_metadata_policy: match file
+                    .fingerprinting
+                    .ja4t
+                    .missing_tcp_metadata_policy
+                {
+                    Ja4TMissingTcpMetadataPolicyFile::FailStartup => {
+                        Ja4TMissingTcpMetadataPolicy::FailStartup
+                    }
+                    Ja4TMissingTcpMetadataPolicyFile::AllowUnavailable => {
+                        Ja4TMissingTcpMetadataPolicy::AllowUnavailable
+                    }
+                },
+            },
+        },
         listeners: file
             .listeners
             .into_iter()
@@ -315,7 +368,7 @@ fn parse_bootstrap_config_toml(raw: &str, source: &str) -> FpResult<BootstrapCon
             .map(|c| crate::config::TlsCertificateConfig {
                 id: c.id,
                 certificate_pem_path: c.certificate_pem_path,
-                private_key_pem_path: c.private_key_pem_path,
+                private_key_provider: parse_private_key_provider(c.private_key_provider),
                 server_names: c
                     .server_names
                     .into_iter()
@@ -390,6 +443,28 @@ fn parse_bootstrap_config_toml(raw: &str, source: &str) -> FpResult<BootstrapCon
         },
         module_enabled: file.module_enabled,
     })
+}
+
+fn parse_private_key_provider(
+    provider: TlsPrivateKeyProviderConfigFile,
+) -> TlsPrivateKeyProviderConfig {
+    match provider.kind.as_str() {
+        "file" => TlsPrivateKeyProviderConfig::File(TlsPrivateKeyFileProviderConfig {
+            pem_path: provider.pem_path.unwrap_or_default(),
+        }),
+        "pkcs11" => TlsPrivateKeyProviderConfig::KnownUnsupported(
+            TlsPrivateKeyKnownUnsupportedProviderKind::Pkcs11,
+        ),
+        "kms" => TlsPrivateKeyProviderConfig::KnownUnsupported(
+            TlsPrivateKeyKnownUnsupportedProviderKind::Kms,
+        ),
+        "tpm" => TlsPrivateKeyProviderConfig::KnownUnsupported(
+            TlsPrivateKeyKnownUnsupportedProviderKind::Tpm,
+        ),
+        kind => TlsPrivateKeyProviderConfig::Unknown(TlsPrivateKeyUnknownProviderConfig {
+            kind: kind.to_string(),
+        }),
+    }
 }
 
 fn parse_cidr(c: CidrFile) -> FpResult<Cidr> {

@@ -1,4 +1,7 @@
-use fingerprint_proxy_bootstrap_config::config::DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS;
+use fingerprint_proxy_bootstrap_config::config::{
+    Ja4TMissingTcpMetadataPolicy, TlsPrivateKeyKnownUnsupportedProviderKind,
+    TlsPrivateKeyProviderConfig, DEFAULT_DYNAMIC_POLLING_INTERVAL_SECONDS,
+};
 use fingerprint_proxy_bootstrap_config::dynamic::upstream_check::UpstreamConnectivityValidationMode;
 use fingerprint_proxy_bootstrap_config::file_provider::{
     detect_config_format, load_bootstrap_config_from_file, ConfigFormat,
@@ -76,6 +79,86 @@ fn load_bootstrap_config_unknown_extension_is_invalid_configuration() {
 }
 
 #[test]
+fn http3_quic_listener_enablement_defaults_disabled() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    assert!(!cfg.enable_http3_quic_listeners);
+}
+
+#[test]
+fn ja4t_missing_tcp_metadata_policy_defaults_fail_startup() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    assert_eq!(
+        cfg.fingerprinting.ja4t.missing_tcp_metadata_policy,
+        Ja4TMissingTcpMetadataPolicy::FailStartup
+    );
+}
+
+#[test]
+fn ja4t_missing_tcp_metadata_policy_parses_allow_unavailable() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[fingerprinting.ja4t]
+missing_tcp_metadata_policy = "allow_unavailable"
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    assert_eq!(
+        cfg.fingerprinting.ja4t.missing_tcp_metadata_policy,
+        Ja4TMissingTcpMetadataPolicy::AllowUnavailable
+    );
+}
+
+#[test]
+fn ja4t_missing_tcp_metadata_policy_rejects_invalid_values() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[fingerprinting.ja4t]
+missing_tcp_metadata_policy = "best_effort"
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("invalid policy");
+
+    assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+    assert!(err.message.contains("missing_tcp_metadata_policy"));
+    assert!(err.message.contains("best_effort"));
+}
+
+#[test]
+fn http3_quic_listener_enablement_parses_explicit_true() {
+    let path = write_temp_config(
+        r#"
+enable_http3_quic_listeners = true
+listeners = [{ bind = "127.0.0.1:0" }]
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    assert!(cfg.enable_http3_quic_listeners);
+}
+
+#[test]
 fn dynamic_provider_upstream_validation_mode_defaults_disabled() {
     let path = write_temp_config(
         r#"
@@ -115,6 +198,29 @@ polling_interval_seconds = 17
 
     let provider = cfg.dynamic_provider.expect("dynamic provider");
     assert_eq!(provider.polling_interval_seconds, 17);
+}
+
+#[test]
+fn dynamic_provider_non_file_kinds_fail_bootstrap_validation_from_toml() {
+    for kind in ["api", "db", "database"] {
+        let path = write_temp_config(&format!(
+            r#"
+listeners = [{{ bind = "127.0.0.1:0" }}]
+
+[dynamic_provider]
+kind = "{kind}"
+"#
+        ));
+
+        let err = load_bootstrap_config_from_file(&path)
+            .expect_err("unsupported dynamic provider kind must fail validation");
+
+        assert_eq!(err.kind, ErrorKind::ValidationFailed);
+        assert!(err.message.contains("bootstrap.dynamic_provider.kind"));
+        assert!(err.message.contains(&format!(
+            "unsupported dynamic provider kind `{kind}`; only `file` is supported for active runtime dynamic configuration"
+        )));
+    }
 }
 
 #[test]
@@ -198,4 +304,128 @@ upstream_connectivity_validation_mode = "permissive"
         .message
         .contains("upstream_connectivity_validation_mode"));
     assert!(err.message.contains("permissive"));
+}
+
+#[test]
+fn tls_private_key_file_provider_parses_from_toml() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[[tls_certificates]]
+id = "default"
+certificate_pem_path = "/certs/default.crt"
+private_key_provider = { kind = "file", pem_path = "/certs/default.key" }
+"#,
+    );
+
+    let cfg = load_bootstrap_config_from_file(&path).expect("load bootstrap config");
+
+    assert_eq!(cfg.tls_certificates.len(), 1);
+    match &cfg.tls_certificates[0].private_key_provider {
+        TlsPrivateKeyProviderConfig::File(provider) => {
+            assert_eq!(provider.pem_path, "/certs/default.key");
+        }
+        other => panic!("expected file private key provider, got {other:?}"),
+    }
+}
+
+#[test]
+fn tls_private_key_provider_rejects_blank_file_path_from_toml() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[[tls_certificates]]
+id = "default"
+certificate_pem_path = "/certs/default.crt"
+private_key_provider = { kind = "file", pem_path = "   " }
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("blank path");
+
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("bootstrap.tls_certificates[0].private_key_provider.pem_path"));
+    assert!(err
+        .message
+        .contains("file private key provider pem_path must be non-empty"));
+}
+
+#[test]
+fn tls_private_key_provider_rejects_known_unsupported_kind_from_toml() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[[tls_certificates]]
+id = "default"
+certificate_pem_path = "/certs/default.crt"
+private_key_provider = { kind = "kms" }
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("unsupported provider");
+
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err.message.contains("private key provider kind `kms`"));
+    assert!(err.message.contains("recognized but not supported"));
+}
+
+#[test]
+fn tls_private_key_provider_rejects_unknown_kind_from_toml() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[[tls_certificates]]
+id = "default"
+certificate_pem_path = "/certs/default.crt"
+private_key_provider = { kind = "vault" }
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("unknown provider");
+
+    assert_eq!(err.kind, ErrorKind::ValidationFailed);
+    assert!(err
+        .message
+        .contains("unknown private key provider kind `vault`"));
+}
+
+#[test]
+fn tls_private_key_provider_rejects_removed_legacy_path_field() {
+    let path = write_temp_config(
+        r#"
+listeners = [{ bind = "127.0.0.1:0" }]
+
+[[tls_certificates]]
+id = "default"
+certificate_pem_path = "/certs/default.crt"
+private_key_pem_path = "/certs/default.key"
+"#,
+    );
+
+    let err = load_bootstrap_config_from_file(&path).expect_err("legacy field");
+
+    assert_eq!(err.kind, ErrorKind::InvalidConfiguration);
+    assert!(err.message.contains("private_key_provider"));
+}
+
+#[test]
+fn known_unsupported_private_key_provider_kind_names_are_stable() {
+    assert_eq!(
+        TlsPrivateKeyKnownUnsupportedProviderKind::Pkcs11.as_str(),
+        "pkcs11"
+    );
+    assert_eq!(
+        TlsPrivateKeyKnownUnsupportedProviderKind::Kms.as_str(),
+        "kms"
+    );
+    assert_eq!(
+        TlsPrivateKeyKnownUnsupportedProviderKind::Tpm.as_str(),
+        "tpm"
+    );
 }

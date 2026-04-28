@@ -2,6 +2,7 @@ use crate::ipv6::normalize_upstream_host;
 use crate::{FpError, FpResult, UPSTREAM_CONNECT_FAILED_MESSAGE};
 use fingerprint_proxy_core::ipv6_mapped::normalize_ipv6_mapped_socket_addr;
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +46,39 @@ pub async fn connect_tcp_with_routing(
     upstream_port: u16,
     preference: AddressFamilyPreference,
 ) -> FpResult<TcpStream> {
+    connect_tcp_with_routing_and_timeout(upstream_host, upstream_port, preference, None).await
+}
+
+pub async fn connect_tcp_with_routing_and_timeout(
+    upstream_host: &str,
+    upstream_port: u16,
+    preference: AddressFamilyPreference,
+    connect_timeout: Option<Duration>,
+) -> FpResult<TcpStream> {
     let normalized_host = normalize_upstream_host(upstream_host)?;
+    let connect_deadline = connect_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let candidates = if let Ok(ip) = normalized_host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, upstream_port)]
     } else {
-        let resolved = tokio::net::lookup_host((normalized_host.as_str(), upstream_port))
-            .await
-            .map_err(|_| FpError::invalid_protocol_data(UPSTREAM_CONNECT_FAILED_MESSAGE))?;
+        let lookup = tokio::net::lookup_host((normalized_host.as_str(), upstream_port));
+        let resolved = match connect_deadline {
+            Some(deadline) => {
+                let Some(remaining) =
+                    remaining_connect_budget(deadline, tokio::time::Instant::now())
+                else {
+                    return Err(FpError::invalid_protocol_data(
+                        UPSTREAM_CONNECT_FAILED_MESSAGE,
+                    ));
+                };
+                tokio::time::timeout(remaining, lookup)
+                    .await
+                    .map_err(|_| FpError::invalid_protocol_data(UPSTREAM_CONNECT_FAILED_MESSAGE))?
+                    .map_err(|_| FpError::invalid_protocol_data(UPSTREAM_CONNECT_FAILED_MESSAGE))?
+            }
+            None => lookup
+                .await
+                .map_err(|_| FpError::invalid_protocol_data(UPSTREAM_CONNECT_FAILED_MESSAGE))?,
+        };
         ordered_candidate_routes(resolved.collect(), preference)
     };
 
@@ -62,7 +89,22 @@ pub async fn connect_tcp_with_routing(
     }
 
     for candidate in candidates {
-        if let Ok(stream) = TcpStream::connect(candidate).await {
+        let connect = TcpStream::connect(candidate);
+        let result = match connect_deadline {
+            Some(deadline) => {
+                let Some(remaining) =
+                    remaining_connect_budget(deadline, tokio::time::Instant::now())
+                else {
+                    break;
+                };
+                match tokio::time::timeout(remaining, connect).await {
+                    Ok(result) => result,
+                    Err(_) => break,
+                }
+            }
+            None => connect.await,
+        };
+        if let Ok(stream) = result {
             return Ok(stream);
         }
     }
@@ -70,6 +112,17 @@ pub async fn connect_tcp_with_routing(
     Err(FpError::invalid_protocol_data(
         UPSTREAM_CONNECT_FAILED_MESSAGE,
     ))
+}
+
+fn remaining_connect_budget(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<Duration> {
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline - now)
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +169,30 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443),
             ]
+        );
+    }
+
+    #[test]
+    fn connect_timeout_budget_is_total_deadline_for_dns_and_candidates() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_millis(100);
+
+        let before_dns = start;
+        let after_dns = start + Duration::from_millis(70);
+        let after_candidate = start + Duration::from_millis(100);
+
+        assert_eq!(
+            remaining_connect_budget(deadline, before_dns),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            remaining_connect_budget(deadline, after_dns),
+            Some(Duration::from_millis(30))
+        );
+        assert_eq!(remaining_connect_budget(deadline, after_candidate), None);
+        assert_eq!(
+            remaining_connect_budget(deadline, start + Duration::from_millis(101)),
+            None
         );
     }
 }

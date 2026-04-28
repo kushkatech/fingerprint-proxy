@@ -4,7 +4,9 @@ use fingerprint_proxy_core::error::{ErrorKind, FpError, FpResult};
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{
+    HttpRequest, HttpResponse, PipelineModuleContext, RequestContext,
+};
 use fingerprint_proxy_hpack::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 use fingerprint_proxy_http1_orchestrator::Http1RouterDeps;
 use fingerprint_proxy_http2::frames::{
@@ -82,7 +84,7 @@ impl PipelineModule for TerminateModule {
         "terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 204);
         Ok(ModuleDecision::Terminate)
     }
@@ -154,15 +156,14 @@ impl Http2RouterDeps for TestHttp2Deps<'_> {
         })
     }
 
-    fn handle_continued<'a>(
-        &'a mut self,
+    fn spawn_continued(
+        &mut self,
+        _stream_id: fingerprint_proxy_http2::StreamId,
         _ctx: RequestContext,
-    ) -> Pin<Box<dyn Future<Output = FpResult<HttpResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            Err(FpError::invalid_protocol_data(
-                "HTTP/2 continued path not used in this test",
-            ))
-        })
+    ) -> FpResult<()> {
+        Err(FpError::invalid_protocol_data(
+            "HTTP/2 continued path not used in this test",
+        ))
     }
 }
 

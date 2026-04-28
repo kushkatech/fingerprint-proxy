@@ -4,7 +4,7 @@ use fingerprint_proxy_core::error::{ErrorKind, FpError, FpResult};
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, PipelineModuleContext};
 use fingerprint_proxy_http3::{map_headers_to_response, Frame, FrameType, HeaderField};
 use fingerprint_proxy_http3_orchestrator::{Http3ConnectionRouter, RouterDeps};
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
@@ -96,7 +96,7 @@ impl PipelineModule for TerminateModule {
         "terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, self.status);
         ctx.response.headers = self.headers.clone();
         ctx.response.body = self.body.clone();
@@ -111,7 +111,7 @@ impl PipelineModule for ContinueModule {
         "cont"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Ok(ModuleDecision::Continue)
     }
 }
@@ -123,7 +123,7 @@ impl PipelineModule for ErrorModule {
         "err"
     }
 
-    fn handle(&self, _ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, _ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         Err(FpError::internal("boom"))
     }
 }
@@ -137,7 +137,7 @@ impl PipelineModule for AssertTrailersThenTerminate {
         "assert-trailers-then-terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         let (k, v) = self.expected_trailer;
         let got = ctx.request.trailers.get(k).map(String::as_str);
         if got != Some(v) {
@@ -295,7 +295,7 @@ impl PipelineModule for TerminateWithTrailers {
         "terminate-with-trailers"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 200);
         ctx.response.trailers = self.trailers.clone();
         ctx.response.body = b"abc".to_vec();
@@ -338,7 +338,7 @@ impl PipelineModule for TerminateWithTrailersNoBody {
         "terminate-with-trailers-no-body"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 200);
         ctx.response.trailers = self.trailers.clone();
         ctx.response.body = Vec::new();
@@ -375,7 +375,7 @@ impl PipelineModule for TerminateWithInvalidTrailers {
         "terminate-with-invalid-trailers"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, 200);
         ctx.response.trailers = self.trailers.clone();
         Ok(ModuleDecision::Terminate)

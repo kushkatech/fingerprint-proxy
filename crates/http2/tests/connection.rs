@@ -269,6 +269,28 @@ fn new_client_stream_headers_must_use_odd_increasing_ids() {
 }
 
 #[test]
+fn client_originated_push_promise_is_protocol_invalid() {
+    let mut conn = Http2Connection::new();
+    conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)
+        .expect("preface");
+
+    let push = frame(
+        FrameType::PushPromise,
+        0x4,
+        sid(1),
+        FramePayload::PushPromise(vec![0, 0, 0, 2]),
+        4,
+    );
+    let err = conn
+        .receive_frame(&push)
+        .expect_err("client PUSH_PROMISE must fail");
+    assert_eq!(
+        err.kind,
+        ConnectionErrorKind::ClientPushPromiseReceived(sid(1))
+    );
+}
+
+#[test]
 fn headers_after_remote_end_stream_are_rejected() {
     let mut conn = Http2Connection::new();
     conn.accept_client_preface(ConnectionPreface::CLIENT_BYTES)

@@ -1,4 +1,6 @@
-use crate::config::{BootstrapConfig, DefaultCertificatePolicy, ServerNamePattern};
+use crate::config::{
+    BootstrapConfig, DefaultCertificatePolicy, ServerNamePattern, TlsPrivateKeyProviderConfig,
+};
 use fingerprint_proxy_core::error::{FpError, FpResult, ValidationIssue, ValidationReport};
 use fingerprint_proxy_tls_termination::config::{
     CertificateId, CertificateRef, DefaultCertificatePolicy as TlsDefaultCertificatePolicy,
@@ -118,62 +120,16 @@ pub fn load_tls_certificates(bootstrap: &BootstrapConfig) -> FpResult<LoadedTlsC
             }
         };
 
-        let key_bytes = match std::fs::read(&entry.private_key_pem_path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.push(ValidationIssue::error(
-                    format!("{base}.private_key_pem_path"),
-                    format!(
-                        "missing TLS private key file: {}",
-                        entry.private_key_pem_path
-                    ),
-                ));
-                continue;
-            }
-            Err(_) => {
-                report.push(ValidationIssue::error(
-                    format!("{base}.private_key_pem_path"),
-                    format!(
-                        "failed to read TLS private key file: {}",
-                        entry.private_key_pem_path
-                    ),
-                ));
-                continue;
-            }
-        };
-
-        let mut key_reader = BufReader::new(key_bytes.as_slice());
-        let key = match rustls_pemfile::private_key(&mut key_reader) {
-            Ok(Some(k)) => k,
-            Ok(None) => {
-                report.push(ValidationIssue::error(
-                    format!("{base}.private_key_pem_path"),
-                    format!(
-                        "missing TLS private key PEM: {}",
-                        entry.private_key_pem_path
-                    ),
-                ));
-                continue;
-            }
-            Err(_) => {
-                report.push(ValidationIssue::error(
-                    format!("{base}.private_key_pem_path"),
-                    format!(
-                        "invalid TLS private key PEM: {}",
-                        entry.private_key_pem_path
-                    ),
-                ));
-                continue;
-            }
+        let Some(key) =
+            load_private_key_from_provider(&base, &entry.private_key_provider, &mut report)
+        else {
+            continue;
         };
 
         if !private_key_matches_leaf_cert_public_key(&certs[0], &key) {
             report.push(ValidationIssue::error(
                 base.to_string(),
-                format!(
-                    "TLS private key does not match certificate: cert={} key={}",
-                    entry.certificate_pem_path, entry.private_key_pem_path
-                ),
+                "TLS private key does not match certificate",
             ));
             continue;
         }
@@ -182,11 +138,8 @@ pub fn load_tls_certificates(bootstrap: &BootstrapConfig) -> FpResult<LoadedTlsC
             Ok(k) => k,
             Err(_) => {
                 report.push(ValidationIssue::error(
-                    format!("{base}.private_key_pem_path"),
-                    format!(
-                        "unsupported TLS private key type: {}",
-                        entry.private_key_pem_path
-                    ),
+                    format!("{base}.private_key_provider"),
+                    "unsupported TLS private key type",
                 ));
                 continue;
             }
@@ -236,6 +189,95 @@ pub fn load_tls_certificates(bootstrap: &BootstrapConfig) -> FpResult<LoadedTlsC
         selection,
         keys_by_id,
     })
+}
+
+fn load_private_key_from_provider(
+    base: &str,
+    provider: &TlsPrivateKeyProviderConfig,
+    report: &mut ValidationReport,
+) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
+    match provider {
+        TlsPrivateKeyProviderConfig::File(file) => {
+            if file.pem_path.trim().is_empty() {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.pem_path"),
+                    "file private key provider pem_path must be non-empty",
+                ));
+                return None;
+            }
+            load_file_private_key(base, &file.pem_path, report)
+        }
+        TlsPrivateKeyProviderConfig::KnownUnsupported(kind) => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.kind"),
+                format!(
+                    "private key provider kind `{}` is recognized but not supported in this build; only `file` is implemented",
+                    kind.as_str()
+                ),
+            ));
+            None
+        }
+        TlsPrivateKeyProviderConfig::Unknown(provider) => {
+            if provider.kind.trim().is_empty() {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.kind"),
+                    "private key provider kind must be non-empty",
+                ));
+            } else {
+                report.push(ValidationIssue::error(
+                    format!("{base}.private_key_provider.kind"),
+                    format!(
+                        "unknown private key provider kind `{}`; supported kind is `file`; recognized-but-unsupported kinds are `pkcs11`, `kms`, `tpm`",
+                        provider.kind
+                    ),
+                ));
+            }
+            None
+        }
+    }
+}
+
+fn load_file_private_key(
+    base: &str,
+    pem_path: &str,
+    report: &mut ValidationReport,
+) -> Option<rustls::pki_types::PrivateKeyDer<'static>> {
+    let key_bytes = match std::fs::read(pem_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.pem_path"),
+                "missing TLS private key file",
+            ));
+            return None;
+        }
+        Err(_) => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.pem_path"),
+                "failed to read TLS private key file",
+            ));
+            return None;
+        }
+    };
+
+    let mut key_reader = BufReader::new(key_bytes.as_slice());
+    match rustls_pemfile::private_key(&mut key_reader) {
+        Ok(Some(k)) => Some(k),
+        Ok(None) => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.pem_path"),
+                "missing TLS private key PEM",
+            ));
+            None
+        }
+        Err(_) => {
+            report.push(ValidationIssue::error(
+                format!("{base}.private_key_provider.pem_path"),
+                "invalid TLS private key PEM",
+            ));
+            None
+        }
+    }
 }
 
 fn build_tls_selection_config(

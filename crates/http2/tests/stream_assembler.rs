@@ -154,7 +154,12 @@ fn headers_then_data_then_end_stream_collects_body() {
         .expect("push")
         .expect("event");
     match ev {
-        StreamEvent::RequestComplete(req) => {
+        StreamEvent::RequestBodyData {
+            bytes,
+            end_stream: true,
+            request_complete: Some(req),
+        } => {
+            assert_eq!(bytes, b"abc".to_vec());
             assert_eq!(req.body, b"abc".to_vec());
         }
         _ => panic!("expected complete"),
@@ -210,10 +215,18 @@ fn headers_data_then_trailers_headers_end_stream_captures_trailers() {
         .expect("event");
     assert!(matches!(ev, StreamEvent::RequestHeadersReady(_)));
 
-    let none = assembler
+    let ev = assembler
         .push_frame(&mut decoder, data_frame(stream_id, 0x0, b"abc".to_vec()))
-        .expect("push");
-    assert!(none.is_none());
+        .expect("push")
+        .expect("event");
+    assert!(matches!(
+        ev,
+        StreamEvent::RequestBodyData {
+            bytes,
+            end_stream: false,
+            request_complete: None,
+        } if bytes == b"abc".to_vec()
+    ));
 
     let trailer_block = encode_header_block(vec![("x-trailer", "v")]);
     let ev = assembler
@@ -225,8 +238,12 @@ fn headers_data_then_trailers_headers_end_stream_captures_trailers() {
         .expect("event");
 
     match ev {
-        StreamEvent::RequestComplete(req) => {
+        StreamEvent::RequestTrailersReady {
+            trailers,
+            request_complete: req,
+        } => {
             assert_eq!(req.body, b"abc".to_vec());
+            assert_eq!(trailers.get("x-trailer").map(String::as_str), Some("v"));
             assert_eq!(req.trailers.get("x-trailer").map(String::as_str), Some("v"));
         }
         _ => panic!("expected complete"),
@@ -251,7 +268,12 @@ fn headers_then_data_end_stream_has_empty_trailers() {
         .expect("event");
 
     match ev {
-        StreamEvent::RequestComplete(req) => {
+        StreamEvent::RequestBodyData {
+            bytes,
+            end_stream: true,
+            request_complete: Some(req),
+        } => {
+            assert_eq!(bytes, b"abc".to_vec());
             assert_eq!(req.body, b"abc".to_vec());
             assert!(req.trailers.is_empty());
         }
@@ -271,10 +293,18 @@ fn trailers_with_pseudo_header_is_error() {
         .push_frame(&mut decoder, headers_frame(stream_id, 0x4, block))
         .expect("push");
 
-    let none = assembler
+    let ev = assembler
         .push_frame(&mut decoder, data_frame(stream_id, 0x0, b"abc".to_vec()))
-        .expect("push");
-    assert!(none.is_none());
+        .expect("push")
+        .expect("event");
+    assert!(matches!(
+        ev,
+        StreamEvent::RequestBodyData {
+            end_stream: false,
+            request_complete: None,
+            ..
+        }
+    ));
 
     let trailer_block = encode_header_block(vec![(":path", "/")]);
     let err = assembler

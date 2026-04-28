@@ -1,7 +1,7 @@
 use fingerprint_proxy_bootstrap_config::config::{
-    CertificateRef, DomainConfig, FingerprintHeaderConfig, ServerNamePattern, UpstreamConfig,
-    UpstreamProtocol, VirtualHostConfig, VirtualHostMatch, VirtualHostProtocolConfig,
-    VirtualHostTlsConfig,
+    CertificateRef, DomainConfig, FingerprintHeaderConfig, Http2ServerPushPolicy,
+    ServerNamePattern, UpstreamConfig, UpstreamProtocol, VirtualHostConfig, VirtualHostMatch,
+    VirtualHostProtocolConfig, VirtualHostTlsConfig,
 };
 use fingerprint_proxy_bootstrap_config::dynamic::atomic_update::{
     prepare_candidate_snapshot, ActiveSnapshotStore, DynamicConfigSnapshot,
@@ -37,6 +37,7 @@ fn domain_config(version: &str, ja4_header: &str, upstream_host: &str) -> Domain
                 allow_http1: true,
                 allow_http2: true,
                 allow_http3: false,
+                http2_server_push_policy: Http2ServerPushPolicy::Suppress,
             },
             module_config: BTreeMap::new(),
         }],

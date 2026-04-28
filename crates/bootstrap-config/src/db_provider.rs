@@ -33,7 +33,7 @@ impl ConfigProvider for DbConfigProvider {
                 "database config provider is unconfigured: missing database connection settings",
             )),
             Some(_) => Err(FpError::invalid_configuration(
-                "database config provider skeleton is unimplemented",
+                "database config provider is unsupported in this build; active runtime dynamic configuration supports only file providers",
             )),
         }
     }

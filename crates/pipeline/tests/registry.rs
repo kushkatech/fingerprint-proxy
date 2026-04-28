@@ -2,7 +2,7 @@ use fingerprint_proxy_core::connection::TransportProtocol;
 use fingerprint_proxy_core::enrichment::{ModuleDecision, ProcessingStage};
 use fingerprint_proxy_core::error::FpResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, RequestContext};
+use fingerprint_proxy_core::request::{HttpRequest, PipelineModuleContext, RequestContext};
 use fingerprint_proxy_core::ConnectionContext;
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 use fingerprint_proxy_pipeline::{PipelineRegistry, PipelineRegistryConfig};
@@ -20,7 +20,7 @@ impl PipelineModule for SetHeaderModule {
         self.name
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         ctx.request
             .headers
             .insert(self.header.to_string(), "1".to_string());

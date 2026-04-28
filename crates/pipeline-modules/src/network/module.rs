@@ -7,7 +7,7 @@ use fingerprint_proxy_core::enrichment::{
     ModuleDecision,
 };
 use fingerprint_proxy_core::error::{FpError, FpResult};
-use fingerprint_proxy_core::request::RequestContext;
+use fingerprint_proxy_core::request::PipelineModuleContext;
 use fingerprint_proxy_pipeline::module::{PipelineModule, PipelineModuleResult};
 
 pub const MODULE_NAME: &str = "network";
@@ -26,8 +26,8 @@ impl PipelineModule for NetworkClassificationModule {
         MODULE_NAME
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
-        let classifier = build_classifier(&ctx.client_network_rules)?;
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
+        let classifier = build_classifier(ctx.client_network_rules)?;
         let classification = classifier.classify(ctx.connection.client_addr.ip());
         ctx.enrichment
             .set_client_network_classification(map_classification(classification));
@@ -78,7 +78,7 @@ mod tests {
     use fingerprint_proxy_core::connection::{ConnectionContext, TransportProtocol};
     use fingerprint_proxy_core::enrichment::ClientNetworkCidr;
     use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-    use fingerprint_proxy_core::request::HttpRequest;
+    use fingerprint_proxy_core::request::{HttpRequest, RequestContext};
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::SystemTime;
@@ -126,8 +126,9 @@ mod tests {
             )],
         );
 
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         NetworkClassificationModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("classification");
 
         assert_eq!(
@@ -147,8 +148,9 @@ mod tests {
             )],
         );
 
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         let decision = NetworkClassificationModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("classification");
 
         assert_eq!(decision, ModuleDecision::Continue);
@@ -174,8 +176,9 @@ mod tests {
             )],
         );
 
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         NetworkClassificationModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("classification");
 
         assert_eq!(
@@ -198,8 +201,9 @@ mod tests {
         cfg.insert("bypass".to_string(), "true".to_string());
         ctx.module_config.insert(MODULE_NAME.to_string(), cfg);
 
+        let mut module_ctx = PipelineModuleContext::new(&mut ctx);
         NetworkClassificationModule::new()
-            .handle(&mut ctx)
+            .handle(&mut module_ctx)
             .expect("classification");
 
         assert_eq!(

@@ -208,6 +208,7 @@ async fn negotiated_h3_fails_deterministically_without_http1_or_http2_fallback()
     let bootstrap = format!(
         r#"
 listener_acquisition_mode = "direct_bind"
+enable_http3_quic_listeners = true
 
 [[listeners]]
 bind = "127.0.0.1:{listener_port}"
@@ -215,7 +216,7 @@ bind = "127.0.0.1:{listener_port}"
 [[tls_certificates]]
 id = "default"
 certificate_pem_path = "{cert_path}"
-private_key_pem_path = "{key_path}"
+private_key_provider = {{ kind = "file", pem_path = "{key_path}" }}
 server_names = [{{ kind = "exact", value = "h3.test" }}]
 
 [default_certificate_policy]

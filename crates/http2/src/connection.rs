@@ -55,6 +55,7 @@ pub enum ConnectionErrorKind {
         stream_id: StreamId,
         last_stream_id: StreamId,
     },
+    ClientPushPromiseReceived(StreamId),
     UnknownStream(StreamId),
     StreamAlreadyClosed(StreamId),
 }
@@ -332,7 +333,12 @@ impl Http2Connection {
                 }
                 Ok(ConnectionEvent::None)
             }
-            FramePayload::Priority(_) | FramePayload::PushPromise(_) => Ok(ConnectionEvent::None),
+            FramePayload::PushPromise(_) => Err(ConnectionError::invalid(
+                self.state,
+                ConnectionOperation::ReceiveFrame,
+                ConnectionErrorKind::ClientPushPromiseReceived(frame.header.stream_id),
+            )),
+            FramePayload::Priority(_) => Ok(ConnectionEvent::None),
         }
     }
 

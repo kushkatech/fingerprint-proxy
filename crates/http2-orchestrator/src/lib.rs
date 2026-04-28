@@ -1,3 +1,3 @@
 pub mod router;
 
-pub use router::{Http2ConnectionRouter, RouterDeps};
+pub use router::{GrpcStreamingStart, Http2ConnectionRouter, RouterDeps};

@@ -4,7 +4,9 @@ use fingerprint_proxy_core::error::{ErrorKind, FpError, FpResult};
 use fingerprint_proxy_core::fingerprint::{Fingerprint, FingerprintAvailability, FingerprintKind};
 use fingerprint_proxy_core::fingerprinting::FingerprintComputationResult;
 use fingerprint_proxy_core::identifiers::{ConfigVersion, ConnectionId, RequestId};
-use fingerprint_proxy_core::request::{HttpRequest, HttpResponse, RequestContext};
+use fingerprint_proxy_core::request::{
+    HttpRequest, HttpResponse, PipelineModuleContext, RequestContext,
+};
 use fingerprint_proxy_hpack::{Decoder, DecoderConfig, Encoder, EncoderConfig};
 use fingerprint_proxy_http1::request::ParseOptions;
 use fingerprint_proxy_http1::response::parse_http1_response;
@@ -91,7 +93,7 @@ impl PipelineModule for TerminateModule {
         "terminate"
     }
 
-    fn handle(&self, ctx: &mut RequestContext) -> PipelineModuleResult {
+    fn handle(&self, ctx: &mut PipelineModuleContext<'_>) -> PipelineModuleResult {
         set_response_status(ctx, self.status);
         ctx.response.headers = self.headers.clone();
         ctx.response.body = self.body.clone();
@@ -128,7 +130,7 @@ impl fingerprint_proxy_http1_orchestrator::Http1RouterDeps for TestHttp1Deps<'_>
     {
         Box::pin(async move {
             Err(FpError::invalid_protocol_data(
-                "STUB[T289]: HTTP/1 upstream is not implemented",
+                "test upstream handler rejected continued request",
             ))
         })
     }
@@ -168,16 +170,14 @@ impl fingerprint_proxy_http2_orchestrator::RouterDeps for TestHttp2Deps<'_> {
         })
     }
 
-    fn handle_continued<'a>(
-        &'a mut self,
+    fn spawn_continued(
+        &mut self,
+        _stream_id: fingerprint_proxy_http2::StreamId,
         _ctx: RequestContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FpResult<HttpResponse>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            Err(FpError::invalid_protocol_data(
-                "HTTP/2 continued path is not used in this dispatcher test",
-            ))
-        })
+    ) -> FpResult<()> {
+        Err(FpError::invalid_protocol_data(
+            "HTTP/2 continued path is not used in this dispatcher test",
+        ))
     }
 }
 
@@ -389,6 +389,21 @@ fn h2_rst_stream_frame_bytes(stream_id: StreamId) -> Vec<u8> {
         payload: FramePayload::RstStream { error_code: 0 },
     };
     serialize_frame(&frame).expect("serialize RST_STREAM")
+}
+
+fn h2_push_promise_frame_bytes(stream_id: StreamId, promised_stream_id: StreamId) -> Vec<u8> {
+    let mut payload = promised_stream_id.as_u32().to_be_bytes().to_vec();
+    payload.extend_from_slice(&[0x82]);
+    let frame = Http2Frame {
+        header: FrameHeader {
+            length: payload.len() as u32,
+            frame_type: FrameType::PushPromise,
+            flags: 0x4,
+            stream_id,
+        },
+        payload: FramePayload::PushPromise(payload),
+    };
+    serialize_frame(&frame).expect("serialize PUSH_PROMISE")
 }
 
 fn h2_data_frame_bytes(stream_id: StreamId, flags: u8, payload: Vec<u8>) -> Vec<u8> {
@@ -1230,6 +1245,56 @@ async fn http2_rst_stream_is_consumed_without_request_routing() {
         panic!("expected Http2Frames");
     };
     assert!(frames.is_empty());
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn http2_client_push_promise_is_rejected_explicitly() {
+    let pipeline = Pipeline::new(vec![Box::new(TerminateModule {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: Vec::new(),
+    })]);
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let mut deps = TestDeps {
+        http1: TestHttp1Deps {
+            pipeline: &pipeline,
+        },
+        http2: TestHttp2Deps {
+            pipeline: &pipeline,
+            decoder: Decoder::new(DecoderConfig {
+                max_dynamic_table_size: 4096,
+            }),
+            encoder: Encoder::new(EncoderConfig {
+                max_dynamic_table_size: 4096,
+                use_huffman: false,
+            }),
+            requests_built: Arc::clone(&request_count),
+        },
+        http3: TestHttp3Deps {
+            pipeline: &pipeline,
+        },
+    };
+
+    let bytes = h2_preface_and_frames_bytes(&[
+        h2_settings_frame_bytes(false),
+        h2_push_promise_frame_bytes(StreamId::new(1).unwrap(), StreamId::new(2).unwrap()),
+    ]);
+    let mut dispatcher = TlsEntryDispatcher::new();
+    let err = dispatcher
+        .dispatch(
+            Some(&NegotiatedAlpn::Http2),
+            DispatcherInput::Http2Bytes(&bytes),
+            &mut deps,
+        )
+        .await
+        .expect_err("client PUSH_PROMISE must fail");
+
+    assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
+    assert_eq!(
+        err.message,
+        "HTTP/2 client-originated PUSH_PROMISE is protocol invalid"
+    );
     assert_eq!(request_count.load(Ordering::SeqCst), 0);
 }
 

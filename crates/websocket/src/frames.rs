@@ -53,7 +53,8 @@ pub fn parse_websocket_frames(input: &[u8]) -> FpResult<Vec<WebSocketFrame>> {
     let mut offset = 0usize;
 
     while offset < input.len() {
-        let (frame, consumed) = match parse_websocket_frame_prefix_detailed(&input[offset..])? {
+        let (frame, consumed) = match parse_websocket_frame_prefix_detailed(&input[offset..], None)?
+        {
             FramePrefixParse::Complete { frame, consumed } => (frame, consumed),
             FramePrefixParse::NeedMore(message) => {
                 return Err(FpError::invalid_protocol_data(message));
@@ -67,7 +68,21 @@ pub fn parse_websocket_frames(input: &[u8]) -> FpResult<Vec<WebSocketFrame>> {
 }
 
 pub fn parse_websocket_frame_prefix(input: &[u8]) -> FpResult<Option<(WebSocketFrame, usize)>> {
-    match parse_websocket_frame_prefix_detailed(input)? {
+    parse_websocket_frame_prefix_with_limit(input, None)
+}
+
+pub fn parse_websocket_frame_prefix_with_max_payload(
+    input: &[u8],
+    max_payload_bytes: usize,
+) -> FpResult<Option<(WebSocketFrame, usize)>> {
+    parse_websocket_frame_prefix_with_limit(input, Some(max_payload_bytes))
+}
+
+fn parse_websocket_frame_prefix_with_limit(
+    input: &[u8],
+    max_payload_bytes: Option<usize>,
+) -> FpResult<Option<(WebSocketFrame, usize)>> {
+    match parse_websocket_frame_prefix_detailed(input, max_payload_bytes)? {
         FramePrefixParse::Complete { frame, consumed } => Ok(Some((frame, consumed))),
         FramePrefixParse::NeedMore(_) => Ok(None),
     }
@@ -81,7 +96,10 @@ enum FramePrefixParse {
     NeedMore(&'static str),
 }
 
-fn parse_websocket_frame_prefix_detailed(input: &[u8]) -> FpResult<FramePrefixParse> {
+fn parse_websocket_frame_prefix_detailed(
+    input: &[u8],
+    max_payload_bytes: Option<usize>,
+) -> FpResult<FramePrefixParse> {
     if input.len() < BASIC_HEADER_LEN {
         return Ok(FramePrefixParse::NeedMore(
             "WebSocket frame parse failed: truncated frame header",
@@ -146,6 +164,13 @@ fn parse_websocket_frame_prefix_detailed(input: &[u8]) -> FpResult<FramePrefixPa
         return Err(FpError::invalid_protocol_data(
             "WebSocket frame parse failed: control frame payload exceeds 125 bytes",
         ));
+    }
+    if let Some(max_payload_bytes) = max_payload_bytes {
+        if payload_len > max_payload_bytes {
+            return Err(FpError::invalid_protocol_data(format!(
+                "WebSocket frame parse failed: payload length {payload_len} exceeds configured maximum {max_payload_bytes}"
+            )));
+        }
     }
 
     let mask_key = if masked {

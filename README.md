@@ -71,19 +71,37 @@ Typical use cases:
 Today, the project already provides a substantial end-to-end runtime surface:
 
 - TLS termination with SNI-based virtual host selection;
+- per-virtual-host protocol policy that drives ALPN advertisement and rejects
+  unsupported protocol combinations instead of silently translating traffic;
 - HTTP/1.1 request parsing, forwarding, keep-alive handling, chunked bodies,
-  and trailers;
-- HTTP/2 framing, request assembly, forwarding, and trailers;
-- transparent WebSocket forwarding over HTTP/1.1;
-- transparent gRPC forwarding over HTTP/2;
+  trailers, and deterministic client-error responses for malformed or oversized
+  requests;
+- HTTP/2 framing, request assembly, trailers, flow control, and shared
+  upstream-session forwarding with concurrent stream multiplexing;
+- cleartext HTTP/2 prior-knowledge (`h2c`) forwarding for the active TCP path;
+- transparent WebSocket forwarding over HTTP/1.1 with bounded frame buffering;
+- transparent gRPC forwarding over HTTP/2, including a gRPC-specific streaming
+  path that does not buffer a whole streaming request before upstream
+  forwarding;
 - JA4, JA4T, and JA4One fingerprint computation;
 - inline Linux saved-SYN capture for ordered TCP option data needed by complete
   JA4T runtime inputs, without passive packet sniffing;
+- a default fail-fast JA4T startup policy when saved-SYN capability cannot be
+  acquired, plus an explicit `allow_unavailable` test/debug mode;
 - fingerprint availability tracking with complete-only upstream header
   propagation;
 - ordered first-match client network classification;
-- dynamic domain configuration via validated immutable snapshots;
-- health endpoints, runtime statistics, and a protected stats API;
+- dynamic domain configuration via validated immutable snapshots, currently
+  using the active runtime file provider;
+- dynamic TLS certificate material reload as part of the same activated runtime
+  snapshot as the matching domain configuration;
+- optional strict dynamic upstream connectivity validation before a candidate
+  snapshot is activated;
+- operational bootstrap timeouts and size limits for active forwarding paths;
+- health endpoints backed by runtime supervision/readiness state;
+- runtime statistics and a stats API that requires explicit access-control
+  configuration when enabled;
+- structured runtime logging with bounded sensitive-data filtering;
 - graceful shutdown foundations;
 - IPv4, IPv6, and dual-stack operation;
 - direct-bind listeners and Linux/systemd inherited-socket listeners.
@@ -99,15 +117,17 @@ contains QUIC packet, frame, runtime-boundary, and fingerprinting foundation
 work that is intended to be carried through to full end-to-end support.
 
 Connection pooling is active for scoped HTTP/1.1 and HTTP/2 runtime forwarding.
-The runtime uses the upstream pool helpers for HTTP/1.1 reusable keep-alive
-connections and sequential HTTP/2 upstream connection reuse for subsequent
-forwarded streams. It does not claim concurrent HTTP/2 multiplex sharing.
-Pooling counters are recorded from forwarded traffic.
+HTTP/1.1 uses reusable keep-alive upstream connections. HTTP/2 uses shared
+upstream sessions keyed by upstream target, concurrent stream leases,
+connection-level HPACK state, flow-control backpressure, GOAWAY drain handling,
+and bounded multi-session saturation behavior. Pooling counters are recorded
+from forwarded traffic.
 
 ## Design Principles
 
 - No HTTP protocol downgrade, upgrade, or translation.
 - Deterministic failure instead of silent fallback.
+- Fail-closed operational surfaces when production access control is required.
 - Clear separation between fingerprinting, request processing, protocol
   handling, and upstream connection management.
 - Snapshot-based dynamic configuration with validation before activation.
@@ -142,8 +162,14 @@ At a high level, request handling follows this flow:
 3. Parse the negotiated HTTP protocol.
 4. Compute fingerprints before pipeline execution.
 5. Build a request context and run deterministic pipeline modules.
-6. Forward the request upstream using the same negotiated application protocol.
+6. Forward the request upstream using the same negotiated application protocol
+   and configured upstream protocol policy.
 7. Return the upstream response without protocol translation.
+
+The authoritative fingerprint result is attached before pipeline execution and
+is exposed to modules through a read-only module context. Built-in and custom
+modules can use fingerprint values for enrichment decisions, but they cannot
+replace the already-computed fingerprint result.
 
 Current built-in request-stage modules include:
 
@@ -178,7 +204,8 @@ single monolith. Important modules include:
 - `crates/pipeline`: deterministic pipeline interfaces and executor.
 - `crates/pipeline-modules`: built-in pipeline modules such as fingerprint
   header injection and network classification.
-- `crates/upstream`: upstream protocol policy and connection management.
+- `crates/upstream`: upstream protocol policy, connection pooling, and shared
+  HTTP/2 session management.
 - `crates/websocket`: WebSocket handshake and proxying support.
 - `crates/grpc`: gRPC detection and transparent forwarding support.
 - `crates/stats` and `crates/stats-api`: runtime statistics aggregation and
@@ -193,10 +220,14 @@ Currently implemented:
 
 - TLS 1.2 / TLS 1.3 termination;
 - SNI-based certificate selection with deterministic matching;
-- HTTP/1.1 upstream forwarding;
-- HTTP/2 upstream forwarding;
-- WebSocket over HTTP/1.1;
-- gRPC over HTTP/2;
+- virtual-host protocol policy for HTTP/1.1, HTTP/2, and HTTP/3 advertisement
+  and acceptance;
+- HTTP/1.1 upstream forwarding with keep-alive reuse;
+- HTTP/2 upstream forwarding with shared-session multiplexing;
+- cleartext HTTP/2 prior-knowledge (`h2c`) forwarding; HTTP/1.1 `Upgrade: h2c`
+  is rejected rather than translated;
+- WebSocket over HTTP/1.1 with validated handshakes and bounded relay frames;
+- gRPC over HTTP/2 for unary requests and detected gRPC streaming requests;
 - JA4 / JA4T / JA4One fingerprint propagation with runtime availability
   tracking;
 - health endpoints and stats API;
@@ -208,6 +239,16 @@ Current limitation:
 
 - HTTP/3 over QUIC is not yet complete as an end-to-end production runtime
   path.
+- HTTP/2 server push forwarding is not implemented; the supported policy is
+  `suppress`, which cancels upstream `PUSH_PROMISE` frames.
+- Active runtime dynamic configuration supports the `file` provider. API and
+  database provider skeletons exist only as deterministic unsupported provider
+  boundaries.
+- TLS private-key loading supports the `file` provider. `pkcs11`, `kms`, and
+  `tpm` are recognized but rejected until real provider-backed signing
+  backends are implemented.
+- Response-stage pipeline modules that require a complete `HttpResponse` are
+  not applied per chunk on the gRPC streaming route.
 
 Planned and already underway:
 
@@ -257,6 +298,77 @@ The runtime uses two configuration layers:
 Dynamic domain configuration is validated before activation and applied through
 immutable snapshots. New connections bind to the latest activated snapshot;
 existing connections continue using the snapshot they were accepted with.
+
+Dynamic activation can optionally run strict upstream connectivity validation:
+
+```toml
+[dynamic_provider]
+kind = "file"
+upstream_connectivity_validation_mode = "strict"
+```
+
+The default is `disabled`; strict mode blocks activation when candidate upstream
+checks fail.
+
+For the active runtime, `[dynamic_provider] kind = "file"` is the supported
+provider. `api`, `db`, `database`, blank, and unknown provider kinds fail
+deterministically during bootstrap validation rather than falling back to file
+retrieval.
+
+TLS private keys are configured through an explicit `private_key_provider`
+block on bootstrap certificates. The implemented provider is:
+
+```toml
+private_key_provider = { kind = "file", pem_path = "/etc/fingerprint-proxy/tls.key" }
+```
+
+Other recognized provider kinds are intentionally not advertised as working
+secret-management integrations yet.
+
+JA4T startup behavior is controlled through bootstrap fingerprinting settings:
+
+```toml
+[fingerprinting.ja4t]
+missing_tcp_metadata_policy = "fail_startup"
+```
+
+`fail_startup` is the default and is the production-oriented behavior. If the
+runtime cannot enable saved-SYN capture on TCP listeners, startup fails instead
+of silently presenting incomplete JA4T as complete. For tests and debugging,
+`missing_tcp_metadata_policy = "allow_unavailable"` allows startup to continue;
+JA4T then remains unavailable when required TCP metadata is missing and no
+production JA4T header value is emitted for that unavailable fingerprint.
+
+Bootstrap timeout and limit settings are active runtime controls. In
+particular, `timeouts.upstream_connect_timeout_ms` bounds upstream TCP connect
+attempts, `timeouts.request_timeout_ms` bounds upstream response/read waits,
+`limits.max_header_bytes` applies to HTTP/1 client and HTTP/1/WebSocket
+upstream headers, and `limits.max_body_bytes` applies to HTTP/1 and HTTP/2
+upstream response bodies. The WebSocket relay also uses `max_body_bytes` as the
+maximum frame payload size; when omitted, it keeps a finite default instead of
+allowing unbounded full-frame buffering.
+
+If the stats API is enabled, omitted required network or authentication controls
+fail bootstrap validation. Production-style examples use an allowlist plus
+bearer-token credentials:
+
+```toml
+[stats_api]
+enabled = true
+bind = "127.0.0.1:9100"
+
+[stats_api.network_policy]
+kind = "require_allowlist"
+allowlist = [{ addr = "127.0.0.1", prefix_len = 32 }]
+
+[stats_api.auth_policy]
+kind = "require_credentials"
+bearer_tokens = ["replace-this-token"]
+```
+
+Generated runtime error responses include deterministic status mapping and
+standard headers such as `Content-Length` and `Date` on the active HTTP/1 and
+HTTP/2 paths.
 
 Example configuration files:
 
