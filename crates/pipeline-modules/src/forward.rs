@@ -11,6 +11,7 @@ const DEPENDS_ON: &[&str] = &[fingerprint_header::MODULE_NAME];
 pub enum ContinuedForwardProtocol {
     Http1,
     Http2,
+    Http3,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +71,15 @@ fn ensure_protocol_matches(
             } else {
                 Err(FpError::invalid_protocol_data(
                     "HTTP/2 continued forwarding requires HTTP/2 request version",
+                ))
+            }
+        }
+        ContinuedForwardProtocol::Http3 => {
+            if request_version == "HTTP/3" {
+                Ok(())
+            } else {
+                Err(FpError::invalid_protocol_data(
+                    "HTTP/3 continued forwarding requires HTTP/3 request version",
                 ))
             }
         }

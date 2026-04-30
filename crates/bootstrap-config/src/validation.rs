@@ -334,6 +334,17 @@ pub fn validate_domain_config(config: &DomainConfig) -> ValidationReport {
             }
         }
 
+        if let Some(roots) = vhost.upstream.tls_trust_roots.as_ref() {
+            if let Some(path) = roots.ca_pem_path.as_ref() {
+                if path.trim().is_empty() {
+                    report.push(ValidationIssue::error(
+                        format!("{base}.upstream.tls_trust_roots.ca_pem_path"),
+                        "CA PEM trust root path must be non-empty when specified",
+                    ));
+                }
+            }
+        }
+
         if vhost.protocol.http2_server_push_policy == Http2ServerPushPolicy::Forward {
             report.push(ValidationIssue::error(
                 format!("{base}.protocol.http2_server_push_policy"),

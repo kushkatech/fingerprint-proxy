@@ -36,6 +36,7 @@ fn domain_config(version: &str, upstream_hosts: &[&str]) -> DomainConfig {
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: (*host).to_string(),
                     port: 8080,
                 },

@@ -32,6 +32,10 @@ pub(crate) fn log_ja4t_saved_syn_startup_unavailable(err: &FpError) {
     log_ja4t_saved_syn_startup_unavailable_with_sink(&CoreRuntimeLogSink, err);
 }
 
+pub(crate) fn log_http3_upstream_failure(stage: &'static str, err: &FpError) {
+    log_http3_upstream_failure_with_sink(&CoreRuntimeLogSink, stage, err);
+}
+
 pub(crate) fn quic_udp_boundary_error_event(
     timestamp_unix_ms: u64,
     err: &FpError,
@@ -75,6 +79,22 @@ pub(crate) fn ja4t_saved_syn_startup_unavailable_event(
     .with_context("error", err.to_string())
 }
 
+pub(crate) fn http3_upstream_failure_event(
+    timestamp_unix_ms: u64,
+    stage: &'static str,
+    err: &FpError,
+) -> StructuredLogEvent {
+    StructuredLogEvent::new(
+        timestamp_unix_ms,
+        LogLevel::Warn,
+        "runtime",
+        "http3_upstream_failure",
+    )
+    .with_context("stage", stage)
+    .with_context("kind", format!("{:?}", err.kind))
+    .with_context("error", err.message.clone())
+}
+
 fn log_quic_udp_boundary_error_with_sink(sink: &dyn RuntimeLogSink, err: &FpError) {
     sink.emit(quic_udp_boundary_error_event(
         current_timestamp_unix_ms(),
@@ -97,6 +117,18 @@ fn log_ja4t_saved_syn_capture_failure_with_sink(
 fn log_ja4t_saved_syn_startup_unavailable_with_sink(sink: &dyn RuntimeLogSink, err: &FpError) {
     sink.emit(ja4t_saved_syn_startup_unavailable_event(
         current_timestamp_unix_ms(),
+        err,
+    ));
+}
+
+fn log_http3_upstream_failure_with_sink(
+    sink: &dyn RuntimeLogSink,
+    stage: &'static str,
+    err: &FpError,
+) {
+    sink.emit(http3_upstream_failure_event(
+        current_timestamp_unix_ms(),
+        stage,
         err,
     ));
 }
@@ -162,6 +194,17 @@ mod tests {
         assert_eq!(
             format_structured_log_event(&event),
             "ts=1710001234567 level=WARN component=runtime message=ja4t_saved_syn_startup_unavailable context={error=Internal: failed to enable TCP_SAVE_SYN on runtime listener,mode=allow_unavailable}"
+        );
+    }
+
+    #[test]
+    fn http3_upstream_failure_log_event_preserves_stage() {
+        let err = FpError::invalid_protocol_data("HTTP/3 upstream response read timed out");
+        let event = http3_upstream_failure_event(1710001234567, "response_read", &err);
+
+        assert_eq!(
+            format_structured_log_event(&event),
+            "ts=1710001234567 level=WARN component=runtime message=http3_upstream_failure context={error=HTTP/3 upstream response read timed out,kind=InvalidProtocolData,stage=response_read}"
         );
     }
 

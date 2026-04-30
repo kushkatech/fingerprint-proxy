@@ -120,6 +120,34 @@ protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = false }
 }
 
 #[test]
+fn upstream_http3_ca_pem_trust_root_path_parses() {
+    let path = write_temp(
+        r#"
+version = "v1"
+
+[[virtual_hosts]]
+id = 1
+match_criteria = { sni = [], destination = [] }
+tls = { certificate = { id = "c1" }, cipher_suites = [] }
+upstream = { protocol = "https", allowed_upstream_app_protocols = ["http3"], host = "a", port = 443, tls_trust_roots = { ca_pem_path = "/etc/fingerprint-proxy/upstream-ca.pem" } }
+protocol = { allow_http1 = true, allow_http2 = true, allow_http3 = true }
+"#,
+        ".toml",
+    );
+
+    let cfg = load_domain_config_from_file(path).expect("load domain config");
+
+    assert_eq!(
+        cfg.virtual_hosts[0]
+            .upstream
+            .tls_trust_roots
+            .as_ref()
+            .and_then(|roots| roots.ca_pem_path.as_deref()),
+        Some("/etc/fingerprint-proxy/upstream-ca.pem")
+    );
+}
+
+#[test]
 fn explicit_http2_server_push_forward_is_validation_failed() {
     let path = write_temp(
         r#"

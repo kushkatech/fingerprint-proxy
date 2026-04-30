@@ -517,7 +517,7 @@ fn continued_path_is_error() {
     assert_eq!(err.kind, ErrorKind::InvalidProtocolData);
     assert_eq!(
         err.message,
-        "STUB[T291]: HTTP/3 upstream is not implemented"
+        "HTTP/3 continued forwarding requires the async runtime boundary"
     );
 }
 

@@ -132,15 +132,14 @@ guaranteed by this slice and should be validated separately.
 
 ## HTTP/3 QUIC Listener Policy
 
-HTTP/3 over QUIC remains a required compliance target, but end-to-end runtime
-forwarding is still open under `T291` via `T308`-`T310`. UDP/QUIC listeners are
-therefore disabled by default.
+HTTP/3 over QUIC remains a required compliance target, and the bounded runtime
+path tracked by `T291`/`T306`-`T310` is complete for explicitly enabled
+direct-bind UDP/QUIC listeners. UDP/QUIC listeners remain disabled by default.
 
-For safe production deployments that do not require the current experimental
-QUIC boundary, leave bootstrap `enable_http3_quic_listeners = false` and keep
-each effective virtual host at `allow_http3 = false`. In this disabled state,
-the runtime does not bind UDP sockets, so UDP bind failures cannot affect
-HTTP/1 or HTTP/2 listener startup.
+For deployments that do not require HTTP/3, leave bootstrap
+`enable_http3_quic_listeners = false` and keep each effective virtual host at
+`allow_http3 = false`. In this disabled state, the runtime does not bind UDP
+sockets, so UDP bind failures cannot affect HTTP/1 or HTTP/2 listener startup.
 
 When explicitly exercising HTTP/3 listener acquisition in `direct_bind` mode,
 bootstrap `enable_http3_quic_listeners = true` must be paired with at least one

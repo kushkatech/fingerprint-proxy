@@ -687,6 +687,7 @@ mod tests {
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "blocked-upstream.example".to_string(),
                     port: 8080,
                 },

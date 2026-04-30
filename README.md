@@ -25,10 +25,10 @@ unavailable rather than complete. The proxy applies deterministic request
 processing modules and forwards traffic using the same negotiated HTTP protocol
 version instead of translating between protocols.
 
-The current implementation focuses on the TCP/TLS path first, but the project
-is intentionally not limited to that path. HTTP/3 over QUIC is part of the
-target runtime surface, and QUIC-specific fingerprinting work is already in
-progress alongside the transport/runtime foundation.
+The current implementation supports the TCP/TLS path and the bounded
+HTTP/3-over-QUIC runtime path for explicitly enabled direct-bind UDP/QUIC
+listeners. QUIC-specific fingerprinting foundations are present alongside the
+HTTP/3 transport/runtime work.
 
 For local evaluation, the repository also includes a Docker demo that puts the
 proxy in front of a small backend page showing the forwarded fingerprint
@@ -54,8 +54,8 @@ Typical use cases:
 - pass complete JA4, JA4T, JA4One, and future fingerprint values to backend
   services through headers while tracking partial or unavailable fingerprints
   internally;
-- prepare for QUIC/HTTP3 traffic where transport-specific fingerprint handling
-  differs from the TCP-oriented JA4T model;
+- handle explicitly enabled QUIC/HTTP3 traffic where transport-specific
+  fingerprint handling differs from the TCP-oriented JA4T model;
 - classify traffic into internal, local, trusted, datacenter, crawler, or any
   other CIDR-based categories;
 - centralize TLS termination and fingerprint enrichment in front of multiple
@@ -83,6 +83,8 @@ Today, the project already provides a substantial end-to-end runtime surface:
 - transparent gRPC forwarding over HTTP/2, including a gRPC-specific streaming
   path that does not buffer a whole streaming request before upstream
   forwarding;
+- bounded HTTP/3-over-QUIC forwarding on explicitly enabled direct-bind
+  UDP/QUIC listeners, with no HTTP/1.1 or HTTP/2 fallback;
 - JA4, JA4T, and JA4One fingerprint computation;
 - inline Linux saved-SYN capture for ordered TCP option data needed by complete
   JA4T runtime inputs, without passive packet sniffing;
@@ -106,15 +108,14 @@ Today, the project already provides a substantial end-to-end runtime surface:
 - IPv4, IPv6, and dual-stack operation;
 - direct-bind listeners and Linux/systemd inherited-socket listeners.
 
-The main remaining runtime gap is HTTP/3 over QUIC. The codebase contains QUIC
-and HTTP/3 foundation work, but full end-to-end runtime HTTP/3 forwarding is
-not complete yet. When HTTP/3 cannot be served, the proxy fails explicitly and
-deterministically instead of falling back to HTTP/2 or HTTP/1.1.
-
-That gap should be read as "not finished yet", not as "out of scope". HTTP/3
-over QUIC remains a required target for the project, and the repository already
-contains QUIC packet, frame, runtime-boundary, and fingerprinting foundation
-work that is intended to be carried through to full end-to-end support.
+HTTP/3 over QUIC is implemented for the bounded runtime path tracked by
+`T291`/`T306`-`T310`: explicitly enabled direct-bind UDP/QUIC listeners accept
+HTTP/3 request streams and forward continued requests to configured HTTPS/QUIC
+upstreams selected for HTTP/3. Legacy `h3` negotiated on the TCP/TLS listener is
+rejected deterministically because HTTP/3 requires QUIC transport; no fallback
+to HTTP/2 or HTTP/1.1 is performed. h3c, HTTP/3 upstream pooling/session
+registry, broad RFC control-stream/session expansion, and protocol translation
+remain out of scope.
 
 Connection pooling is active for scoped HTTP/1.1 and HTTP/2 runtime forwarding.
 HTTP/1.1 uses reusable keep-alive upstream connections. HTTP/2 uses shared
@@ -150,6 +151,8 @@ reverse proxy. In practice, that means it already gives you:
 - strict protocol preservation instead of hidden HTTP downgrades or upgrades;
 - support for modern backend-facing traffic patterns such as WebSocket and
   gRPC;
+- bounded HTTP/3-over-QUIC forwarding for explicitly enabled direct-bind
+  UDP/QUIC listeners;
 - runtime stats and health endpoints for operational deployment;
 - deployment flexibility across direct-bind and inherited-socket models.
 
@@ -196,8 +199,8 @@ single monolith. Important modules include:
   acquisition integration points.
 - `crates/http1`: HTTP/1.x parsing and serialization.
 - `crates/http2`: HTTP/2 frame, header, and request/response handling.
-- `crates/http3` and `crates/quic`: HTTP/3 and QUIC foundations for the
-  in-progress runtime path.
+- `crates/http3` and `crates/quic`: HTTP/3 and QUIC protocol foundations used
+  by the bounded runtime path.
 - `crates/fingerprinting`: JA4, JA4T, JA4One, availability tracking, and
   fingerprint orchestration logic.
 - `crates/prepipeline`: request-context assembly from already-available inputs.
@@ -224,6 +227,8 @@ Currently implemented:
   and acceptance;
 - HTTP/1.1 upstream forwarding with keep-alive reuse;
 - HTTP/2 upstream forwarding with shared-session multiplexing;
+- HTTP/3-over-QUIC upstream forwarding for explicitly enabled direct-bind
+  UDP/QUIC listeners and HTTP/3-capable HTTPS upstreams;
 - cleartext HTTP/2 prior-knowledge (`h2c`) forwarding; HTTP/1.1 `Upgrade: h2c`
   is rejected rather than translated;
 - WebSocket over HTTP/1.1 with validated handshakes and bounded relay frames;
@@ -237,8 +242,9 @@ Currently implemented:
 
 Current limitation:
 
-- HTTP/3 over QUIC is not yet complete as an end-to-end production runtime
-  path.
+- HTTP/3-over-QUIC support is intentionally bounded: h3c, HTTP/3 upstream
+  pooling/session registry, and broad RFC control-stream/session expansion are
+  not implemented.
 - HTTP/2 server push forwarding is not implemented; the supported policy is
   `suppress`, which cancels upstream `PUSH_PROMISE` frames.
 - Active runtime dynamic configuration supports the `file` provider. API and
@@ -252,7 +258,6 @@ Current limitation:
 
 Planned and already underway:
 
-- end-to-end HTTP/3 over QUIC runtime support;
 - QUIC-aware fingerprint handling built around transport-appropriate signals
   rather than reusing JA4T where it does not fit;
 - QUIC-specific JA4One derivation with explicit transport distinction;
@@ -283,7 +288,8 @@ the project ships JA4, JA4T, and JA4One for the active TCP/TLS path, with JA4T
 complete only when ordered TCP option data is available. For the QUIC path, the
 repository already contains groundwork for QUIC-specific fingerprint outputs,
 including transport-distinct JA4One handling and a stable QUIC metadata
-signature surface, while end-to-end HTTP/3 runtime support is being completed.
+signature surface, while the bounded HTTP/3 runtime path is now active for
+explicitly enabled direct-bind UDP/QUIC listeners.
 
 ## Configuration Model
 

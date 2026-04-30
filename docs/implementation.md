@@ -68,8 +68,11 @@ The implementation supports:
 - liveness/readiness health endpoints;
 - runtime statistics and stats API.
 
-## Known Runtime Gap
+## HTTP/3 Runtime Status
 
-HTTP/3 over QUIC remains the canonical runtime compliance gap. Deterministic
-`STUB[T291]` behavior remains until Phase 22 completes and runtime HTTP/3 over
-QUIC is implemented end-to-end.
+HTTP/3 over QUIC is implemented for the bounded runtime path tracked by
+`T291`/`T306`-`T310`: explicitly enabled direct-bind UDP/QUIC listeners can
+accept HTTP/3 request streams and forward continued requests to configured
+HTTPS/QUIC upstreams selected for HTTP/3. h3c, pooling/session registry, broad
+RFC control-stream/session expansion, and HTTP/3-to-HTTP/2/HTTP/1 fallback or
+translation remain out of scope.

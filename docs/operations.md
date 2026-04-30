@@ -79,22 +79,23 @@ without network and authentication controls.
 
 ## HTTP/3 Status
 
-HTTP/3 over QUIC remains a required compliance target and the canonical runtime
-compliance gap. End-to-end HTTP/3 forwarding is still open under `T291`; wait
-for `T291` closure via `T308`-`T310` before treating HTTP/3 as production-ready.
+HTTP/3 over QUIC remains a required compliance target. The bounded runtime path
+tracked by `T291`/`T306`-`T310` is complete for explicitly enabled direct-bind
+UDP/QUIC listeners.
 
 UDP/QUIC listeners are not bound by default. For safe production deployments
 with HTTP/3 disabled, leave bootstrap `enable_http3_quic_listeners = false` and
 keep effective virtual hosts at `allow_http3 = false`; UDP bind failures cannot
 affect HTTP/1 or HTTP/2 startup in that configuration.
 
-The current experimental QUIC boundary requires both bootstrap
+The active QUIC boundary requires both bootstrap
 `enable_http3_quic_listeners = true` and at least one effective virtual host
 with `allow_http3 = true`. The one-true/one-false combinations are validation
 errors. `enable_http3_quic_listeners = true` is also rejected with
 `listener_acquisition_mode = "inherited_systemd"` because inherited UDP sockets
 are not supported.
 
-Negotiated `h3` still fails deterministically with the tracked `STUB[T291]`
-behavior. No HTTP/1 or HTTP/2 fallback, downgrade, upgrade, or translation is
-performed.
+HTTP/3 over QUIC is available on explicitly enabled direct-bind UDP/QUIC
+listeners. Legacy `h3` negotiated over the TCP/TLS listener is rejected
+deterministically because HTTP/3 requires QUIC transport. No HTTP/1 or HTTP/2
+fallback, downgrade, upgrade, or translation is performed.

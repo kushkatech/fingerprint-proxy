@@ -30,6 +30,7 @@ fn domain_config(version: &str, ja4_header: &str, upstream_host: &str) -> Domain
             upstream: UpstreamConfig {
                 protocol: UpstreamProtocol::Http,
                 allowed_upstream_app_protocols: None,
+                tls_trust_roots: None,
                 host: upstream_host.to_string(),
                 port: 8080,
             },

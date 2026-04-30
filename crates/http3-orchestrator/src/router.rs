@@ -107,7 +107,7 @@ impl Http3ConnectionRouter {
                 |trailers| deps.encode_response_trailers(trailers),
             ),
             Ok(OrchestrationOutcome::Continued { .. }) => Err(FpError::invalid_protocol_data(
-                "STUB[T291]: HTTP/3 upstream is not implemented",
+                "HTTP/3 continued forwarding requires the async runtime boundary",
             )),
             Err(e) => Err(e),
         }

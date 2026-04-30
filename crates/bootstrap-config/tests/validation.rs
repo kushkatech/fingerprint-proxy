@@ -75,6 +75,7 @@ fn domain_config_with_http3(allow_http3: bool) -> DomainConfig {
             upstream: UpstreamConfig {
                 protocol: UpstreamProtocol::Http,
                 allowed_upstream_app_protocols: None,
+                tls_trust_roots: None,
                 host: "example.internal".into(),
                 port: 8080,
             },
@@ -535,6 +536,22 @@ fn bootstrap_rejects_unknown_private_key_provider_kind() {
 }
 
 #[test]
+fn domain_config_rejects_blank_upstream_ca_pem_trust_root_path() {
+    let mut config = domain_config_with_http3(true);
+    config.virtual_hosts[0].upstream.tls_trust_roots = Some(UpstreamTlsTrustRootsConfig {
+        ca_pem_path: Some("   ".to_string()),
+    });
+
+    let report = validate_domain_config(&config);
+
+    assert!(report.has_errors());
+    assert!(report.issues.iter().any(|issue| {
+        issue.path == "domain.virtual_hosts[0].upstream.tls_trust_roots.ca_pem_path"
+            && issue.message == "CA PEM trust root path must be non-empty when specified"
+    }));
+}
+
+#[test]
 fn domain_config_errors_on_multiple_default_virtual_hosts() {
     let config = DomainConfig {
         version: ConfigVersion::new("v1").unwrap(),
@@ -555,6 +572,7 @@ fn domain_config_errors_on_multiple_default_virtual_hosts() {
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "example.internal".into(),
                     port: 8080,
                 },
@@ -582,6 +600,7 @@ fn domain_config_errors_on_multiple_default_virtual_hosts() {
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "example2.internal".into(),
                     port: 8081,
                 },

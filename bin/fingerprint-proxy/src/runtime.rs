@@ -52,10 +52,6 @@ use fingerprint_proxy_pipeline_modules::register_builtin_modules;
 use fingerprint_proxy_prepipeline::{
     run_prepared_pipeline, OrchestrationOutcome, PrePipelineInput,
 };
-use fingerprint_proxy_quic::{
-    parse_packet_header as parse_quic_packet_header, QuicEstablishment, QuicEstablishmentError,
-    QuicPacketError,
-};
 use fingerprint_proxy_stats::{PoolingEvent, RuntimeStatsRegistry};
 use fingerprint_proxy_tls_entry::{
     DispatcherDeps, DispatcherInput, DispatcherOutput, NegotiatedAlpn, TlsEntryDispatcher,
@@ -120,9 +116,6 @@ const DEFAULT_HTTP2_SHARED_SESSION_SATURATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(50);
 const DEFAULT_HTTP2_SHARED_SESSION_SATURATION_POLL: std::time::Duration =
     std::time::Duration::from_millis(5);
-const QUIC_UDP_RECV_BUFFER_BYTES: usize = 2048;
-const QUIC_SHORT_HEADER_DESTINATION_CONNECTION_ID_LEN: usize = 0;
-const QUIC_UDP_RUNTIME_STUB_MESSAGE: &str = "STUB[T291]: QUIC UDP runtime boundary reached; HTTP/3 end-to-end forwarding remains unimplemented (no HTTP/2 or HTTP/1.x fallback)";
 const HTTP2_SHARED_SESSION_SATURATION_TIMEOUT_MESSAGE: &str =
     "HTTP/2 shared upstream sessions saturated before bounded acquisition timeout";
 const TCP_SAVE_SYN_LINUX: libc::c_int = 27;
@@ -313,10 +306,26 @@ async fn run_until_shutdown(
         });
     }
 
+    let quinn_http3_server_config = if runtime_listeners.quic_udp.is_empty() {
+        None
+    } else {
+        Some(build_quinn_http3_server_config_for_runtime(
+            &bootstrap,
+            active_domain_snapshot.config(),
+        )?)
+    };
+
     for quic_udp_socket in runtime_listeners.quic_udp {
         let shutdown_rx = shutdown.clone();
-        supervisor
-            .spawn(async move { serve_quic_udp_listener(quic_udp_socket, shutdown_rx).await });
+        let http3_deps = deps.http3.clone_for_connection();
+        http3_deps.bind_runtime_snapshot(Arc::clone(&active_domain_snapshot));
+        let server_config = quinn_http3_server_config
+            .as_ref()
+            .ok_or_else(|| FpError::internal("missing QUIC server config for HTTP/3 listener"))?
+            .clone();
+        supervisor.spawn(async move {
+            serve_quic_udp_listener(quic_udp_socket, server_config, http3_deps, shutdown_rx).await
+        });
     }
 
     {
@@ -596,6 +605,83 @@ async fn acquire_runtime_udp_sockets(
     }
 }
 
+fn build_quinn_http3_server_config_for_runtime(
+    bootstrap: &fingerprint_proxy_bootstrap_config::config::BootstrapConfig,
+    domain: &fingerprint_proxy_bootstrap_config::config::DomainConfig,
+) -> FpResult<quinn::ServerConfig> {
+    let http3_cert_id = domain
+        .virtual_hosts
+        .iter()
+        .find(|vhost| vhost.protocol.allow_http3)
+        .map(|vhost| vhost.tls.certificate.id.as_str())
+        .ok_or_else(|| {
+            FpError::invalid_configuration(
+                "HTTP/3 QUIC listener enabled but no HTTP/3 virtual host certificate is configured",
+            )
+        })?;
+    let cert_cfg = bootstrap
+        .tls_certificates
+        .iter()
+        .find(|cert| cert.id == http3_cert_id)
+        .ok_or_else(|| {
+            FpError::invalid_configuration(format!(
+                "missing bootstrap TLS certificate material for HTTP/3 certificate id: {http3_cert_id}"
+            ))
+        })?;
+
+    let cert_bytes = std::fs::read(&cert_cfg.certificate_pem_path).map_err(|e| {
+        FpError::invalid_configuration(format!(
+            "failed to read HTTP/3 QUIC certificate file {}: {e}",
+            cert_cfg.certificate_pem_path
+        ))
+    })?;
+    let mut cert_reader = std::io::BufReader::new(cert_bytes.as_slice());
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            FpError::invalid_configuration(format!(
+                "invalid HTTP/3 QUIC certificate PEM {}: {e}",
+                cert_cfg.certificate_pem_path
+            ))
+        })?;
+    if cert_chain.is_empty() {
+        return Err(FpError::invalid_configuration(format!(
+            "empty HTTP/3 QUIC certificate chain: {}",
+            cert_cfg.certificate_pem_path
+        )));
+    }
+
+    let fingerprint_proxy_bootstrap_config::config::TlsPrivateKeyProviderConfig::File(key_file) =
+        &cert_cfg.private_key_provider
+    else {
+        return Err(FpError::invalid_configuration(
+            "HTTP/3 QUIC runtime requires file-backed TLS private key material for Quinn endpoint setup",
+        ));
+    };
+    let key_bytes = std::fs::read(&key_file.pem_path).map_err(|e| {
+        FpError::invalid_configuration(format!(
+            "failed to read HTTP/3 QUIC private key file {}: {e}",
+            key_file.pem_path
+        ))
+    })?;
+    let mut key_reader = std::io::BufReader::new(key_bytes.as_slice());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| {
+            FpError::invalid_configuration(format!(
+                "invalid HTTP/3 QUIC private key PEM {}: {e}",
+                key_file.pem_path
+            ))
+        })?
+        .ok_or_else(|| {
+            FpError::invalid_configuration(format!(
+                "missing HTTP/3 QUIC private key PEM: {}",
+                key_file.pem_path
+            ))
+        })?;
+
+    crate::http3::build_quinn_http3_server_config(cert_chain, key)
+}
+
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -667,9 +753,16 @@ async fn serve_listener(
 
 async fn serve_quic_udp_listener(
     socket: UdpSocket,
+    server_config: quinn::ServerConfig,
+    http3_deps: crate::http3::Http3RuntimeBoundaryDeps,
     mut shutdown: watch::Receiver<bool>,
 ) -> FpResult<()> {
-    let mut recv_buf = vec![0u8; QUIC_UDP_RECV_BUFFER_BYTES];
+    let socket = socket
+        .into_std()
+        .map_err(|e| FpError::internal(format!("UDP socket handoff to QUIC failed: {e}")))?;
+    let runtime =
+        crate::http3::build_quinn_http3_transport_runtime_from_udp_socket(socket, server_config)?;
+
     loop {
         tokio::select! {
             biased;
@@ -678,13 +771,8 @@ async fn serve_quic_udp_listener(
                     break;
                 }
             }
-            recv = socket.recv_from(&mut recv_buf) => {
-                let (n, _peer_addr) = recv.map_err(|e| FpError::internal(format!("UDP recv failed: {e}")))?;
-                if n == 0 {
-                    continue;
-                }
-
-                if let Err(err) = handle_quic_udp_datagram(&recv_buf[..n]) {
+            routed = runtime.accept_and_route_request_stream_to_runtime_boundary(&http3_deps) => {
+                if let Err(err) = routed {
                     crate::runtime_logging::log_quic_udp_boundary_error(&err);
                 }
             }
@@ -692,27 +780,6 @@ async fn serve_quic_udp_listener(
     }
 
     Ok(())
-}
-
-fn handle_quic_udp_datagram(datagram: &[u8]) -> FpResult<()> {
-    let packet_header =
-        parse_quic_packet_header(datagram, QUIC_SHORT_HEADER_DESTINATION_CONNECTION_ID_LEN)
-            .map_err(map_quic_packet_error)?;
-    let mut establishment = QuicEstablishment::new();
-    establishment
-        .accept_client_initial(&packet_header, datagram.len())
-        .map_err(map_quic_establishment_error)?;
-    Err(FpError::invalid_protocol_data(
-        QUIC_UDP_RUNTIME_STUB_MESSAGE,
-    ))
-}
-
-fn map_quic_packet_error(error: QuicPacketError) -> FpError {
-    FpError::invalid_protocol_data(format!("QUIC UDP packet parse error: {error:?}"))
-}
-
-fn map_quic_establishment_error(error: QuicEstablishmentError) -> FpError {
-    FpError::invalid_protocol_data(format!("QUIC UDP establishment error: {error:?}"))
 }
 
 async fn handle_connection(tcp: TcpStream, deps: &mut RuntimeDeps) -> FpResult<()> {
@@ -729,6 +796,11 @@ async fn handle_connection_with_read_buf_size(
     let local_addr = tcp.local_addr().ok();
     deps.http1.ensure_runtime_config_loaded()?;
     deps.http2.bind_runtime_snapshot_from_http1(&deps.http1)?;
+    let http3_snapshot = deps
+        .http1
+        .bound_runtime_snapshot()
+        .ok_or_else(|| FpError::internal("HTTP/1 runtime snapshot is not bound"))?;
+    deps.http3.bind_runtime_snapshot(http3_snapshot);
     let runtime_snapshot = deps
         .http1
         .bound_runtime_snapshot
@@ -788,7 +860,7 @@ async fn handle_connection_with_read_buf_size(
     match &negotiated_alpn {
         Some(NegotiatedAlpn::Http1) | Some(NegotiatedAlpn::Http2) => {}
         Some(NegotiatedAlpn::Http3) => {
-            return Err(crate::http3::negotiated_h3_runtime_stub_error());
+            return Err(crate::http3::negotiated_h3_tcp_tls_rejection_error());
         }
         Some(NegotiatedAlpn::Other(_)) => {
             return Err(FpError::invalid_protocol_data(
@@ -804,8 +876,10 @@ async fn handle_connection_with_read_buf_size(
     ) {
         deps.http1.set_connection_addrs(peer_addr, local_addr);
         deps.http2.set_connection_addrs(peer_addr, local_addr);
+        deps.http3.set_connection_addrs(peer_addr, local_addr);
         deps.http1.set_tls_sni(sni.clone());
-        deps.http2.set_tls_sni(sni);
+        deps.http2.set_tls_sni(sni.clone());
+        deps.http3.set_tls_sni(sni);
         let runtime_fingerprinting_result = compute_runtime_fingerprinting_result_for_stream(
             peer_addr,
             local_addr,
@@ -819,6 +893,9 @@ async fn handle_connection_with_read_buf_size(
                 .set_runtime_fingerprinting_result(runtime_fingerprinting_result),
             Some(NegotiatedAlpn::Http2) => deps
                 .http2
+                .set_runtime_fingerprinting_result(runtime_fingerprinting_result),
+            Some(NegotiatedAlpn::Http3) => deps
+                .http3
                 .set_runtime_fingerprinting_result(runtime_fingerprinting_result),
             _ => {}
         }
@@ -1707,7 +1784,21 @@ impl RuntimeDeps {
                 Arc::clone(&upstream_tls_client_config),
                 runtime_settings,
             ),
-            http3: crate::http3::Http3RuntimeBoundaryDeps::new(Arc::clone(&pipeline)),
+            http3: crate::http3::Http3RuntimeBoundaryDeps::new(
+                Arc::clone(&pipeline),
+                Arc::clone(&next_request_id),
+                Arc::clone(&next_connection_id),
+                Arc::clone(&runtime_stats),
+                dynamic_config_state.clone(),
+                crate::http3::Http3UpstreamRuntimeSettings {
+                    upstream_connect_timeout: runtime_settings.upstream_connect_timeout,
+                    upstream_request_timeout: runtime_settings.upstream_request_timeout,
+                    max_response_header_bytes: runtime_settings
+                        .http1_upstream_limits
+                        .max_header_bytes,
+                    max_response_body_bytes: runtime_settings.http2_upstream_limits.max_body_bytes,
+                },
+            ),
             dynamic_config_state,
             operational_state,
         }
@@ -1717,7 +1808,7 @@ impl RuntimeDeps {
         RuntimeDeps {
             http1: self.http1.clone_for_connection(),
             http2: self.http2.clone_for_connection(),
-            http3: crate::http3::Http3RuntimeBoundaryDeps::new(Arc::clone(&self.http1.pipeline)),
+            http3: self.http3.clone_for_connection(),
             dynamic_config_state: self.dynamic_config_state.clone(),
             operational_state: self.operational_state.clone(),
         }
@@ -2151,14 +2242,14 @@ fn parse_tcp_syn_header(tcp: &[u8]) -> FpResult<ParsedSavedSynMetadata> {
     })
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn select_virtual_host<'a>(
+pub(crate) fn select_virtual_host<'a>(
     domain: &'a fingerprint_proxy_bootstrap_config::config::DomainConfig,
     sni: Option<&str>,
     destination: Option<SocketAddr>,
@@ -2217,7 +2308,7 @@ fn select_virtual_host<'a>(
         .find(|v| v.match_criteria.sni.is_empty() && v.match_criteria.destination.is_empty())
 }
 
-fn build_request_module_config(
+pub(crate) fn build_request_module_config(
     selected_vhost: Option<&fingerprint_proxy_bootstrap_config::config::VirtualHostConfig>,
     domain: Option<&fingerprint_proxy_bootstrap_config::config::DomainConfig>,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
@@ -2246,7 +2337,7 @@ fn build_request_module_config(
     module_config
 }
 
-fn build_client_network_rules(
+pub(crate) fn build_client_network_rules(
     domain: Option<&fingerprint_proxy_bootstrap_config::config::DomainConfig>,
 ) -> Vec<ClientNetworkClassificationRule> {
     domain
@@ -4369,7 +4460,7 @@ impl Http2RouterDeps for Http2Deps {
     }
 }
 
-fn missing_fingerprinting_result(at: SystemTime) -> FingerprintComputationResult {
+pub(crate) fn missing_fingerprinting_result(at: SystemTime) -> FingerprintComputationResult {
     let mk = |kind| CoreFingerprint {
         kind,
         availability: FingerprintAvailability::Unavailable,
@@ -4856,6 +4947,30 @@ mod tests {
             .with_no_client_auth()
     }
 
+    fn quinn_client_config(ca_cert_pem: &str) -> quinn::ClientConfig {
+        let mut reader = std::io::BufReader::new(ca_cert_pem.as_bytes());
+        let cas = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse ca cert");
+        let mut roots = quinn::rustls::RootCertStore::empty();
+        for ca in cas {
+            roots.add(ca).expect("add root");
+        }
+
+        let mut client_crypto = quinn::rustls::ClientConfig::builder_with_provider(
+            quinn::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&quinn::rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![crate::http3::HTTP3_ALPN.to_vec()];
+        quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .expect("quic client crypto"),
+        ))
+    }
+
     async fn presented_certificate_for_server_config(
         server_config: Arc<ServerConfig>,
         trusted_ca_cert_pem: &str,
@@ -5324,21 +5439,6 @@ mod tests {
         p
     }
 
-    fn sample_quic_initial_datagram() -> Vec<u8> {
-        let mut datagram = Vec::new();
-        datagram.push(0xc0);
-        datagram.extend_from_slice(&1u32.to_be_bytes());
-        datagram.push(8);
-        datagram.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        datagram.push(8);
-        datagram.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
-        datagram.push(0);
-        datagram.push(1);
-        datagram.push(0);
-        datagram.resize(QuicEstablishment::MIN_CLIENT_INITIAL_DATAGRAM_LEN, 0);
-        datagram
-    }
-
     #[test]
     fn bootstrap_config_invalid_is_validation_failed() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5476,6 +5576,62 @@ kind = "reject"
             .expect("UDP bound addr");
         assert!(udp_bound_addr.ip().is_loopback());
         assert_ne!(udp_bound_addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn quic_udp_runtime_endpoint_rejects_empty_quinn_request_stream() {
+        let pki = TestPki::generate();
+        let bootstrap = pki.bootstrap_config();
+        let mut domain_config = make_domain_config_for_ports(
+            unused_local_port(),
+            unused_local_port(),
+            unused_local_port(),
+        );
+        domain_config.virtual_hosts[0].tls.certificate.id = "example".to_string();
+        domain_config.virtual_hosts[0].protocol.allow_http3 = true;
+        let server_config = build_quinn_http3_server_config_for_runtime(&bootstrap, &domain_config)
+            .expect("quinn server config");
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP");
+        let server_addr = socket.local_addr().expect("UDP addr");
+        let runtime = crate::http3::build_quinn_http3_transport_runtime_from_udp_socket(
+            socket.into_std().expect("UDP socket into std"),
+            server_config,
+        )
+        .expect("quinn transport runtime");
+        let mut deps = RuntimeDeps::new(Arc::new(Pipeline::new(Vec::new())));
+        deps.http3.set_domain_config(domain_config);
+        let http3_deps = deps.http3;
+        let server_task = tokio::spawn(async move {
+            runtime
+                .accept_and_route_request_stream_to_runtime_boundary(&http3_deps)
+                .await
+        });
+
+        let mut client_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+                .expect("client endpoint");
+        client_endpoint.set_default_client_config(quinn_client_config(&pki.ca_cert_pem));
+        let connection = client_endpoint
+            .connect(server_addr, "example.com")
+            .expect("start QUIC connect")
+            .await
+            .expect("QUIC connect");
+        let (mut send, _recv) = connection.open_bi().await.expect("open request stream");
+        send.write_all(&[])
+            .await
+            .expect("write empty request stream event");
+        send.finish().expect("finish request stream");
+
+        let err = server_task
+            .await
+            .expect("server task")
+            .expect_err("empty HTTP/3 request stream is malformed");
+        assert_eq!(
+            err.kind,
+            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
+        );
+        assert_eq!(err.message, "HTTP/3 stream finished before HEADERS");
     }
 
     #[tokio::test]
@@ -5689,28 +5845,6 @@ kind = "reject"
         assert_eq!(err.kind, fingerprint_proxy_core::error::ErrorKind::Internal);
         assert_eq!(err.message, "post-shutdown task failure");
         assert!(operational_state.is_supervision_failed());
-    }
-
-    #[test]
-    fn quic_udp_boundary_reaches_t291_stub_for_client_initial() {
-        let err = handle_quic_udp_datagram(&sample_quic_initial_datagram())
-            .expect_err("client Initial should reach deterministic runtime boundary stub");
-        assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
-        );
-        assert_eq!(err.message, QUIC_UDP_RUNTIME_STUB_MESSAGE);
-    }
-
-    #[test]
-    fn quic_udp_boundary_invalid_datagram_maps_to_deterministic_protocol_error() {
-        let err = handle_quic_udp_datagram(&[])
-            .expect_err("invalid datagram must fail deterministically");
-        assert_eq!(
-            err.kind,
-            fingerprint_proxy_core::error::ErrorKind::InvalidProtocolData
-        );
-        assert_eq!(err.message, "QUIC UDP packet parse error: Empty");
     }
 
     #[test]
@@ -7746,6 +7880,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: 1,
                     },
@@ -7773,6 +7908,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: 1,
                     },
@@ -7816,6 +7952,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_a,
                     },
@@ -7843,6 +7980,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_default,
                     },
@@ -7870,6 +8008,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Https,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: https_port,
                     },
@@ -7922,6 +8061,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "127.0.0.1".to_string(),
                     port,
                 },
@@ -9767,6 +9907,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "127.0.0.1".to_string(),
                     port: port_a,
                 },
@@ -9830,6 +9971,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_dest,
                     },
@@ -9857,6 +9999,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_default,
                     },
@@ -9922,6 +10065,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_dest,
                     },
@@ -9949,6 +10093,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                     upstream: UpstreamConfig {
                         protocol: UpstreamProtocol::Http,
                         allowed_upstream_app_protocols: None,
+                        tls_trust_roots: None,
                         host: "127.0.0.1".to_string(),
                         port: port_default,
                     },
@@ -10047,6 +10192,7 @@ HTTP2-Settings: AAMAAABkAAQAAP__\r\n\
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Https,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "localhost".to_string(),
                     port: https_port,
                 },
@@ -10503,7 +10649,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
         );
         assert_eq!(
             err.message,
-            "STUB[T291]: HTTP/3 negotiated but QUIC is not implemented"
+            crate::http3::NEGOTIATED_H3_TCP_TLS_REJECTION_MESSAGE
         );
     }
 
@@ -10639,6 +10785,7 @@ protocol = {{ allow_http1 = true, allow_http2 = false, allow_http3 = false }}
                 upstream: UpstreamConfig {
                     protocol: UpstreamProtocol::Http,
                     allowed_upstream_app_protocols: None,
+                    tls_trust_roots: None,
                     host: "127.0.0.1".to_string(),
                     port: 1,
                 },

@@ -141,8 +141,16 @@ struct UpstreamFile {
     protocol: UpstreamProtocolFile,
     #[serde(default)]
     allowed_upstream_app_protocols: Option<Vec<UpstreamAppProtocolFile>>,
+    #[serde(default)]
+    tls_trust_roots: Option<UpstreamTlsTrustRootsFile>,
     host: String,
     port: u16,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UpstreamTlsTrustRootsFile {
+    #[serde(default)]
+    ca_pem_path: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -273,6 +281,12 @@ fn map_virtual_host(v: VirtualHostFile) -> FpResult<VirtualHostConfig> {
                 })
                 .collect()
         }),
+        tls_trust_roots: v
+            .upstream
+            .tls_trust_roots
+            .map(|roots| UpstreamTlsTrustRootsConfig {
+                ca_pem_path: roots.ca_pem_path,
+            }),
         host: v.upstream.host,
         port: v.upstream.port,
     };

@@ -123,6 +123,7 @@ fn domain_config_with_cert(version: &str, cert_id: &str) -> DomainConfig {
             upstream: UpstreamConfig {
                 protocol: UpstreamProtocol::Http,
                 allowed_upstream_app_protocols: None,
+                tls_trust_roots: None,
                 host: "upstream.internal".to_string(),
                 port: 8080,
             },

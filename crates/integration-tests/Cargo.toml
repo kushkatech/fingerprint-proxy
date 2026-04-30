@@ -20,9 +20,10 @@ fingerprint-proxy-pipeline = { path = "../pipeline" }
 fingerprint-proxy-prepipeline = { path = "../prepipeline" }
 fingerprint-proxy-tls-entry = { path = "../tls-entry" }
 fingerprint-proxy-upstream = { path = "../upstream" }
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = "=0.12.1"
 rustls = "0.22"
 rustls-pemfile = "2.2"
 serde_json = "1.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 tokio-rustls = "0.25"

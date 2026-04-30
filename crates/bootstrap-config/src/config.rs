@@ -208,8 +208,14 @@ pub enum TlsMinimumVersion {
 pub struct UpstreamConfig {
     pub protocol: UpstreamProtocol,
     pub allowed_upstream_app_protocols: Option<Vec<UpstreamAppProtocol>>,
+    pub tls_trust_roots: Option<UpstreamTlsTrustRootsConfig>,
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamTlsTrustRootsConfig {
+    pub ca_pem_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
